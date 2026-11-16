@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>报表控制台</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">REPORT PORTAL / SQLITE</div>
+      <h1>报表控制台</h1>
+    </div>
+    <div class="process-card">
+      <span id="process-dot" class="dot"></span>
+      <span id="process-label">调度器加载中</span>
+      <span id="active-count" class="process-count">0 个运行任务</span>
+      <button class="ghost" data-process="start">启动</button>
+      <button class="ghost" data-process="pause">暂停</button>
+      <button class="ghost" data-process="resume">恢复</button>
+      <button class="ghost" data-process="stop">停止</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <div class="sidebar-title"><span>报表定义</span><button id="new-report" class="primary small">＋ 新建</button></div>
+      <div id="report-list" class="report-list"></div>
+      <div class="sidebar-foot"><span class="status-pill">● SQLite</span><span id="database-path"></span></div>
+    </aside>
+
+    <section class="workspace">
+      <div class="tabs">
+        <button class="tab active" data-tab="definition">报表定义</button>
+        <button class="tab" data-tab="results">运行结果</button>
+        <button class="tab" data-tab="runs">执行历史</button>
+      </div>
+
+      <section id="definition-panel" class="panel tab-panel active">
+        <div class="panel-heading"><div><div class="eyebrow">DEFINITION</div><h2 id="editor-title">新建报表</h2></div><div class="actions"><button id="delete-report" class="danger ghost" disabled>删除</button><button id="save-report" class="primary">保存定义</button></div></div>
+        <form id="report-form">
+          <div class="form-grid">
+            <label>报表名称<input id="name" required maxlength="120" placeholder="例如：月度销售分析"></label>
+            <label>图表类型<select id="chart-type"><option value="table">表格</option><option value="line">折线图</option><option value="bar">柱状图</option><option value="pie">饼图</option></select></label>
+            <label class="wide">说明<textarea id="description" rows="2" placeholder="这份报表给谁看，用来回答什么问题？"></textarea></label>
+            <label class="wide">SQL 查询<textarea id="sql" rows="7" spellcheck="false" required placeholder="SELECT month, SUM(amount) AS amount FROM demo_sales GROUP BY month ORDER BY month"></textarea><span class="hint">只允许 SELECT / WITH / EXPLAIN 查询；结果首列作为横轴，第二列作为数值。</span></label>
+            <label>横轴列<input id="x-column" placeholder="month"></label>
+            <label>数值列<input id="y-column" placeholder="amount"></label>
+            <label>自动运行间隔（分钟）<input id="schedule" type="number" min="0" step="1" value="0"><span class="hint">0 表示只手动运行</span></label>
+            <fieldset><legend>运行选项</legend><label class="check"><input id="enabled" type="checkbox" checked> 启用自动调度</label></fieldset>
+            <fieldset><legend>输出格式</legend><label class="check"><input type="checkbox" value="html" checked> HTML</label><label class="check"><input type="checkbox" value="xlsx" checked> Excel</label><label class="check"><input type="checkbox" value="csv"> CSV</label></fieldset>
+            <label class="wide">统计公式（每行一条）<textarea id="formulas" rows="5" spellcheck="false" placeholder="最大值 = MAX(amount)
+最小值 = MIN(amount)
+平均值 = AVERAGE(amount)
+积分值 = INTEGRAL(amount, month)"></textarea><span class="hint">支持 MAX、MIN、AVERAGE、SUM、COUNT 和 INTEGRAL；也支持 Excel 单元格范围，如 <code>=MAX(B2:B100)</code>、<code>=INTEGRAL(B2:B100,A2:A100)</code>。</span></label>
+          </div>
+          <div id="form-message" class="message"></div>
+        </form>
+        <section class="designer-section">
+          <div class="designer-heading"><div><div class="eyebrow">LAYOUT DESIGNER</div><h3>报表版式</h3><p>编辑单元格内容和样式；按住 Shift 点击可选择区域。</p></div><div class="designer-actions"><button type="button" class="ghost small" id="copy-cells">复制区域</button><button type="button" class="ghost small" id="paste-cells">粘贴区域</button><button type="button" class="ghost small" id="merge-cells">合并单元格</button><button type="button" class="ghost small" id="split-cells">拆分单元格</button></div></div>
+          <div class="designer-toolbar"><label>字号<select id="cell-font-size"><option>11</option><option selected>13</option><option>16</option><option>20</option><option>24</option></select></label><button type="button" class="ghost small" id="cell-bold">粗体</button><button type="button" class="ghost small" id="cell-italic">斜体</button><label>文字色<input id="cell-color" type="color" value="#172033"></label><label>填充色<input id="cell-background" type="color" value="#ffffff"></label><label>对齐<select id="cell-align"><option value="left">左对齐</option><option value="center">居中</option><option value="right">右对齐</option></select></label><label>线型<select id="cell-border"><option value="thin">细线</option><option value="medium">粗线</option><option value="dashed">虚线</option><option value="none">无框线</option></select></label></div>
+          <div id="layout-grid" class="layout-grid" aria-label="报表版式网格"></div>
+        </section>
+        <div class="run-strip"><div><strong>立即生成</strong><span>执行当前 SQL，生成 HTML/Excel，并把结果放入运行历史。</span></div><button id="run-report" class="primary" disabled>运行报表</button></div>
+      </section>
+
+      <section id="results-panel" class="panel tab-panel">
+        <div class="panel-heading"><div><div class="eyebrow">RESULTS</div><h2>报表结果</h2></div><button id="refresh-results" class="ghost">刷新</button></div>
+        <div id="result-empty" class="empty">选择一条成功的运行记录查看结果。</div>
+        <div id="result-meta" class="result-meta hidden"></div>
+        <div id="result-summary" class="summary-box hidden"></div>
+        <div id="result-chart" class="result-chart hidden"></div>
+        <div class="table-wrap"><table id="result-table"><thead></thead><tbody></tbody></table></div>
+      </section>
+
+      <section id="runs-panel" class="panel tab-panel">
+        <div class="panel-heading"><div><div class="eyebrow">RUN HISTORY</div><h2>执行历史</h2></div><button id="refresh-runs" class="ghost">刷新</button></div>
+        <div id="runs-list" class="runs-list"></div>
+      </section>
+    </section>
+  </main>
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
