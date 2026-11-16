@@ -29,7 +29,10 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 OUTPUT_DIR = ROOT / "output"
 STATIC_DIR = ROOT / "static"
-DB_PATH = Path(os.environ.get("REPORT_DB_PATH", str(DATA_DIR / "report.db"))).expanduser()
+DEFAULT_DB_DIR = Path(
+    os.environ.get("REPORT_DB_DIR", r"D:\codex\sqldb\realtime\statics")
+).expanduser()
+DB_PATH = Path(os.environ.get("REPORT_DB_PATH", str(DEFAULT_DB_DIR / "report.db"))).expanduser()
 if not DB_PATH.is_absolute():
     DB_PATH = (Path.cwd() / DB_PATH).resolve()
 

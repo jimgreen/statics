@@ -8,7 +8,7 @@
 - 网格版式设计器：编辑单元格内容，Shift 选择区域，复制/粘贴、合并/拆分、字号、粗体/斜体、文字色、填充色、对齐和线型；版式保存在报表定义中，并输出到 HTML 和 Excel 的“版式”工作表。
 - 单元格/图元独立数据源：每个网格元素可单独选择静态内容、主查询字段、独立只读 SQL 或统计公式；元素类型支持文本、数值/字段、动态表格和折线/柱状/饼图。动态表格不预设行数，按独立 SQL 返回结果在指定单元格展开。
 - Excel 风格统计公式：每行一条“名称 = 公式”，支持 `MAX`、`MIN`、`AVERAGE`、`SUM`、`COUNT` 和按横轴梯形积分的 `INTEGRAL(数值列, 时间列)`；也支持 `B2:B100` 单元格范围。
-- 后端使用 SQLite 保存报表定义和运行历史；默认数据库会创建 `demo_sales` 示例表。
+- 后端使用 SQLite 保存报表定义和运行历史；默认数据库文件为 `D:\codex\sqldb\realtime\statics\report.db`，外部默认数据库不会创建演示数据。
 - 异步执行报表 SQL，生成 HTML、CSV 和带原生图表的 XLSX。
 - 定时调度线程：按报表的“间隔分钟”执行；支持启动、暂停、恢复和停止。
 - 运行历史、数据表格预览、HTML/Excel 下载。
@@ -17,6 +17,13 @@
 
   ```powershell
   $env:REPORT_DB_PATH='D:\data\business.db'
+  python .\report_portal\app.py
+  ```
+
+  如果只需要更换默认数据库目录，可设置 `REPORT_DB_DIR`；数据库文件名固定为 `report.db`：
+
+  ```powershell
+  $env:REPORT_DB_DIR='D:\data\reports'
   python .\report_portal\app.py
   ```
 
