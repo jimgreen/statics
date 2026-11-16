@@ -264,6 +264,8 @@ def normalize_layout(value: Any) -> dict[str, Any]:
     rows = min(max(int(value.get("rows", 8)), 1), 30)
     cols = min(max(int(value.get("cols", 8)), 1), 20)
     cells: dict[str, Any] = {}
+    allowed_elements = {"text", "value", "table", "chart"}
+    allowed_sources = {"static", "report_field", "sql", "formula"}
     for key, raw_cell in (value.get("cells") or {}).items():
         if not re.fullmatch(r"r\d+c\d+", str(key)) or not isinstance(raw_cell, dict):
             continue
@@ -286,7 +288,35 @@ def normalize_layout(value: Any) -> dict[str, Any]:
             "align": str(raw_style.get("align", "left")) if str(raw_style.get("align", "left")) in {"left", "center", "right"} else "left",
             "border": str(raw_style.get("border", "thin")) if str(raw_style.get("border", "thin")) in {"none", "thin", "medium", "dashed"} else "thin",
         }
-        cells[str(key)] = {"value": str(raw_cell.get("value", ""))[:500], "style": style}
+        element = str(raw_cell.get("element", "text"))
+        if element not in allowed_elements:
+            element = "text"
+        raw_source = raw_cell.get("data_source") if isinstance(raw_cell.get("data_source"), dict) else {}
+        source_type = str(raw_source.get("type", "static"))
+        if source_type not in allowed_sources:
+            source_type = "static"
+        source_sql = str(raw_source.get("sql", "")).strip()
+        if source_sql:
+            source_sql_normalized = source_sql.lower().lstrip()
+            if not (source_sql_normalized.startswith("select") or source_sql_normalized.startswith("with") or source_sql_normalized.startswith("explain")) or ";" in source_sql.rstrip(";"):
+                raise ValueError(f"单元格 {key} 的数据源 SQL 只允许单条只读查询")
+        chart_type = str(raw_source.get("chart_type", "line"))
+        if chart_type not in {"line", "bar", "pie"}:
+            chart_type = "line"
+        aggregate = str(raw_source.get("aggregate", "first"))
+        if aggregate not in {"first", "sum", "avg", "min", "max", "count"}:
+            aggregate = "first"
+        data_source = {
+            "type": source_type,
+            "field": str(raw_source.get("field", ""))[:120],
+            "sql": source_sql[:4000],
+            "formula": str(raw_source.get("formula", ""))[:300],
+            "aggregate": aggregate,
+            "chart_type": chart_type,
+            "x_field": str(raw_source.get("x_field", ""))[:120],
+            "y_field": str(raw_source.get("y_field", ""))[:120],
+        }
+        cells[str(key)] = {"value": str(raw_cell.get("value", ""))[:500], "element": element, "data_source": data_source, "style": style}
     merges = []
     for raw_merge in value.get("merges") or []:
         if not isinstance(raw_merge, dict):
@@ -515,7 +545,91 @@ def layout_style(style: dict[str, Any]) -> str:
     ])
 
 
-def render_layout_html(layout: dict[str, Any]) -> str:
+def aggregate_cell_values(values: list[Any], aggregate: str) -> Any:
+    if not values:
+        return ""
+    if aggregate == "first":
+        return values[0]
+    numbers = [number(item) for item in values]
+    numbers = [item for item in numbers if item is not None]
+    if aggregate == "count":
+        return len(values)
+    if not numbers:
+        return ""
+    if aggregate == "sum":
+        return sum(numbers)
+    if aggregate == "avg":
+        return sum(numbers) / len(numbers)
+    if aggregate == "min":
+        return min(numbers)
+    if aggregate == "max":
+        return max(numbers)
+    return values[0]
+
+
+def execute_data_source(source: dict[str, Any], report_rows: list[dict[str, Any]]) -> Any:
+    source_type = source.get("type", "static")
+    if source_type == "static":
+        return source.get("value", "")
+    if source_type == "formula":
+        return evaluate_formula(str(source.get("formula", "")), report_rows)
+    if source_type == "report_field":
+        field = str(source.get("field", ""))
+        values = [row.get(field) for row in report_rows if field in row]
+        return aggregate_cell_values(values, str(source.get("aggregate", "first")))
+    if source_type == "sql":
+        sql = str(source.get("sql", "")).strip()
+        if not sql:
+            return []
+        with connection() as conn:
+            conn.execute("PRAGMA query_only = ON")
+            result = conn.execute(sql)
+            columns = [item[0] for item in result.description or []]
+            return [{column: json_value(value) for column, value in zip(columns, row)} for row in result.fetchall()]
+    return ""
+
+
+def cell_data_rows(source: dict[str, Any], report_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    value = execute_data_source(source, report_rows)
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def render_data_table(data_rows: list[dict[str, Any]]) -> str:
+    if not data_rows:
+        return '<span class="muted">暂无数据</span>'
+    columns = list(data_rows[0].keys())
+    head = "".join(f"<th>{html.escape(str(column))}</th>" for column in columns)
+    body = "".join("<tr>" + "".join(f"<td>{html.escape(str(row.get(column, '')))}</td>" for column in columns) + "</tr>" for row in data_rows)
+    return f'<table class="element-table"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>'
+
+
+def render_layout_cell(cell: dict[str, Any], report_rows: list[dict[str, Any]]) -> str:
+    source = cell.get("data_source") or {"type": "static"}
+    source.setdefault("value", cell.get("value", ""))
+    value = execute_data_source(source, report_rows)
+    element = cell.get("element", "text")
+    if element == "table":
+        return render_data_table(cell_data_rows(source, report_rows))
+    if element == "chart":
+        data_rows = cell_data_rows(source, report_rows)
+        if not data_rows and isinstance(value, list):
+            data_rows = value
+        columns = list(data_rows[0].keys()) if data_rows else []
+        chart_type = source.get("chart_type", "line")
+        x_field = source.get("x_field") or (columns[0] if columns else "")
+        y_field = source.get("y_field") or (columns[1] if len(columns) > 1 else "")
+        return chart_svg(data_rows, chart_type, x_field, y_field) if data_rows else '<span class="muted">暂无图表数据</span>'
+    if isinstance(value, list):
+        if value and isinstance(value[0], dict):
+            value = value[0].get(source.get("field", ""), next(iter(value[0].values()), ""))
+        else:
+            value = value[0] if value else ""
+    return html.escape(str(value if value is not None else ""))
+
+
+def render_layout_html(layout: dict[str, Any], report_rows: list[dict[str, Any]]) -> str:
     if not layout.get("cells") and not layout.get("merges"):
         return ""
     cells = layout.get("cells", {})
@@ -537,7 +651,7 @@ def render_layout_html(layout: dict[str, Any]) -> str:
             style = cell.get("style", {})
             merge = merge_map.get((row, col), {})
             attrs = f' rowspan="{merge.get("rowspan", 1)}" colspan="{merge.get("colspan", 1)}"' if merge else ""
-            cells_html.append(f'<td{attrs} style="{layout_style(style)}">{html.escape(str(cell.get("value", "")))}</td>')
+            cells_html.append(f'<td{attrs} style="{layout_style(style)}">{render_layout_cell(cell, report_rows)}</td>')
         rows_html.append(f"<tr>{''.join(cells_html)}</tr>")
     return f'<section class="designed-layout"><h2>报表版式</h2><table><tbody>{"".join(rows_html)}</tbody></table></section>'
 
@@ -617,7 +731,7 @@ def render_html(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int,
     )
     summary = f'<section class="summary"><h2>统计值</h2><table><thead><tr><th>指标</th><th>公式</th><th>结果</th></tr></thead><tbody>{summary_rows}</tbody></table></section>' if summaries else ""
     chart = chart_svg(rows, report["chart_type"], report["x_column"], report["y_column"])
-    designed_layout = render_layout_html(report.get("layout", {}))
+    designed_layout = render_layout_html(report.get("layout", {}), rows)
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>{html.escape(report['name'])}</title>
 <style>body{{font-family:system-ui, sans-serif;margin:32px;color:#182230}} table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #d8dee8;padding:8px;text-align:left}} th{{background:#eef3f8}} .chart{{max-width:760px;width:100%;margin:12px 0}} .axis{{stroke:#64748b;stroke-width:1}} .bar{{fill:#2b6cb0;opacity:.85}} .line{{fill:none;stroke:#d97706;stroke-width:3}} .point{{fill:#d97706}} .label,.legend{{font-size:12px;fill:#334155}} .muted{{color:#64748b}}</style></head>
@@ -690,12 +804,58 @@ def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: in
         layout = report.get("layout") or {}
         if layout.get("cells") or layout.get("merges"):
             layout_sheet = workbook.create_sheet("版式")
+            chart_data_sheet = None
             for row in range(layout.get("rows", 8)):
                 for col in range(layout.get("cols", 8)):
                     cell = layout_sheet.cell(row=row + 1, column=col + 1)
                     definition = (layout.get("cells") or {}).get(f"r{row}c{col}", {})
                     style = definition.get("style", {})
-                    cell.value = definition.get("value", "")
+                    source = dict(definition.get("data_source") or {"type": "static"})
+                    source.setdefault("value", definition.get("value", ""))
+                    element = definition.get("element", "text")
+                    if element == "table":
+                        table_rows = cell_data_rows(source, rows)
+                        cell.value = ""
+                        if table_rows:
+                            table_columns = list(table_rows[0].keys())
+                            for offset, column_name in enumerate(table_columns):
+                                target = layout_sheet.cell(row=row + 1, column=col + offset + 1, value=column_name)
+                                target.font = Font(bold=True, color="FFFFFF")
+                                target.fill = PatternFill("solid", fgColor="2563EB")
+                            for row_offset, data_row in enumerate(table_rows, start=1):
+                                for offset, column_name in enumerate(table_columns):
+                                    layout_sheet.cell(row=row + row_offset + 1, column=col + offset + 1, value=data_row.get(column_name))
+                    elif element == "chart":
+                        cell.value = definition.get("value", "")
+                        chart_rows = cell_data_rows(source, rows)
+                        chart_columns = list(chart_rows[0].keys()) if chart_rows else []
+                        if chart_rows and len(chart_columns) >= 2:
+                            if chart_data_sheet is None:
+                                chart_data_sheet = workbook.create_sheet("图元数据")
+                            base_col = 1
+                            base_row = chart_data_sheet.max_row + 2
+                            chart_data_sheet.cell(row=base_row, column=base_col, value=f"R{row + 1}C{col + 1}")
+                            for offset, column_name in enumerate(chart_columns):
+                                chart_data_sheet.cell(row=base_row + 1, column=base_col + offset, value=column_name)
+                            for row_offset, data_row in enumerate(chart_rows, start=2):
+                                for offset, column_name in enumerate(chart_columns):
+                                    chart_data_sheet.cell(row=base_row + row_offset, column=base_col + offset, value=data_row.get(column_name))
+                            chart_kind = {"bar": BarChart, "line": LineChart, "pie": PieChart}.get(source.get("chart_type", "line"), LineChart)
+                            element_chart = chart_kind()
+                            data = Reference(chart_data_sheet, min_col=base_col + 1, min_row=base_row + 1, max_row=base_row + len(chart_rows) + 1)
+                            labels = Reference(chart_data_sheet, min_col=base_col, min_row=base_row + 2, max_row=base_row + len(chart_rows) + 1)
+                            element_chart.add_data(data, titles_from_data=True)
+                            element_chart.set_categories(labels)
+                            element_chart.title = str(definition.get("value", "图表"))
+                            layout_sheet.add_chart(element_chart, cell.coordinate)
+                    else:
+                        resolved = execute_data_source(source, rows)
+                        if isinstance(resolved, list):
+                            if resolved and isinstance(resolved[0], dict):
+                                resolved = resolved[0].get(source.get("field", ""), next(iter(resolved[0].values()), ""))
+                            else:
+                                resolved = resolved[0] if resolved else ""
+                        cell.value = resolved
                     cell.font = Font(name="Microsoft YaHei", size=style.get("fontSize", 13), bold=style.get("bold", False), italic=style.get("italic", False), color=str(style.get("color", "#172033")).replace("#", ""))
                     cell.alignment = Alignment(horizontal=style.get("align", "left"), vertical="center", wrap_text=True)
                     cell.fill = PatternFill("solid", fgColor=str(style.get("background", "#ffffff")).replace("#", ""))

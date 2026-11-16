@@ -60,6 +60,17 @@
         <section class="designer-section">
           <div class="designer-heading"><div><div class="eyebrow">LAYOUT DESIGNER</div><h3>报表版式</h3><p>编辑单元格内容和样式；按住 Shift 点击可选择区域。</p></div><div class="designer-actions"><button type="button" class="ghost small" id="copy-cells">复制区域</button><button type="button" class="ghost small" id="paste-cells">粘贴区域</button><button type="button" class="ghost small" id="merge-cells">合并单元格</button><button type="button" class="ghost small" id="split-cells">拆分单元格</button></div></div>
           <div class="designer-toolbar"><label>字号<select id="cell-font-size"><option>11</option><option selected>13</option><option>16</option><option>20</option><option>24</option></select></label><button type="button" class="ghost small" id="cell-bold">粗体</button><button type="button" class="ghost small" id="cell-italic">斜体</button><label>文字色<input id="cell-color" type="color" value="#172033"></label><label>填充色<input id="cell-background" type="color" value="#ffffff"></label><label>对齐<select id="cell-align"><option value="left">左对齐</option><option value="center">居中</option><option value="right">右对齐</option></select></label><label>线型<select id="cell-border"><option value="thin">细线</option><option value="medium">粗线</option><option value="dashed">虚线</option><option value="none">无框线</option></select></label></div>
+          <div class="element-source-toolbar">
+            <label>元素类型<select id="cell-element"><option value="text">文本</option><option value="value">数值/字段</option><option value="table">动态表格</option><option value="chart">图表控件</option></select></label>
+            <label>数据源<select id="cell-source-type"><option value="static">静态内容</option><option value="report_field">主查询字段</option><option value="sql">独立 SQL 查询</option><option value="formula">统计公式</option></select></label>
+            <label>字段<input id="cell-source-field" placeholder="amount"></label>
+            <label>聚合<select id="cell-source-aggregate"><option value="first">首个值</option><option value="sum">求和</option><option value="avg">平均</option><option value="min">最小</option><option value="max">最大</option><option value="count">计数</option></select></label>
+            <label>图表<select id="cell-source-chart"><option value="line">折线</option><option value="bar">柱状</option><option value="pie">饼图</option></select></label>
+            <label>X 轴字段<input id="cell-source-x" placeholder="month"></label>
+            <label>Y 轴字段<input id="cell-source-y" placeholder="amount"></label>
+            <label class="element-source-wide">独立 SQL / 公式<textarea id="cell-source-query" rows="3" spellcheck="false" placeholder="SELECT month, amount FROM demo_sales ORDER BY month 或 =MAX(amount)"></textarea></label>
+            <span class="hint element-source-wide">先选中网格单元格，再定义它自己的数据源。动态表格不需要预先填写行数，会按 SQL 返回结果展开。</span>
+          </div>
           <div id="layout-grid" class="layout-grid" aria-label="报表版式网格"></div>
         </section>
         <div class="run-strip"><div><strong>立即生成</strong><span>执行当前 SQL，生成 HTML/Excel，并把结果放入运行历史。</span></div><button id="run-report" class="primary" disabled>运行报表</button></div>
