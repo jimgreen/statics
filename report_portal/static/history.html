@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>执行历史 - 报表控制台</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><div class="eyebrow">REPORT PORTAL / SQLITE</div><h1>报表控制台</h1></div>
+    <div class="process-card"><span id="process-dot" class="dot"></span><span id="process-label">调度器加载中</span><span id="active-count" class="process-count">0 个运行任务</span><button class="ghost" data-process="start">启动</button><button class="ghost" data-process="pause">暂停</button><button class="ghost" data-process="resume">恢复</button><button class="ghost" data-process="stop">停止</button></div>
+  </header>
+  <main class="layout">
+    <aside class="sidebar"><div class="sidebar-title"><span>报表定义</span><button id="new-report" class="primary small">＋ 新建</button></div><input id="report-search" type="search" aria-label="搜索报表" placeholder="搜索名称或说明"><div id="report-list" class="report-list"></div><div class="sidebar-foot"><span class="status-pill">● SQLite</span><span id="database-path"></span></div></aside>
+    <section class="workspace">
+      <div id="workspace-overview" class="workspace-overview" aria-label="报表概况"></div>
+      <nav class="page-nav" aria-label="报表功能页面"><a class="" href="/definition">报表定义</a><a class="" href="/results">运行结果</a><a class="active" href="/history">执行历史</a></nav>
+            <section id="runs-panel" class="panel page-panel">
+        <div class="panel-heading"><div><div class="eyebrow">RUN HISTORY</div><h2>执行历史</h2></div><button id="refresh-runs" class="ghost">刷新</button></div>
+        <div class="history-filters"><input id="run-search" type="search" aria-label="搜索执行历史" placeholder="报表名称或参数"><select id="run-status-filter" aria-label="运行状态"><option value="">全部状态</option><option value="success">成功</option><option value="failed">失败</option><option value="running">运行中</option></select><select id="run-trigger-filter" aria-label="触发来源"><option value="">全部来源</option><option value="manual">人工触发</option><option value="scheduled">定时触发</option><option value="legacy">旧版记录</option></select><button id="reset-run-filters" class="ghost small">清除筛选</button><span class="hint">查询全部历史 · 当前页每 5 秒刷新 · 时间按浏览器时区显示</span></div>
+        <div id="history-metrics" class="metric-grid" aria-label="当前筛选统计"></div><div id="history-message" class="hint" aria-live="polite"></div><div id="runs-list" class="runs-list"></div>
+        <div class="pager"><label>每页<select id="history-page-size" aria-label="历史每页条数"><option selected>20</option><option>50</option><option>100</option></select></label><span id="history-page-info" aria-live="polite"></span><button id="history-prev" class="ghost small">上一页</button><button id="history-next" class="ghost small">下一页</button></div>
+      </section>
+    </section>
+  </main>
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js"></script><script src="/static/workbench.js"></script>
+</body>
+</html>

@@ -11,6 +11,7 @@ function elapsed(milliseconds) {
   return milliseconds<1000 ? `${Math.round(milliseconds)} ms` : `${(milliseconds/1000).toFixed(2)} 秒`;
 }
 function renderOverview() {
+  if(!$('#workspace-overview')) return;
   const enabled=state.reports.filter(r=>r.enabled && r.schedule_type!=='manual');
   const next=enabled.filter(r=>r.next_run_at).sort((a,b)=>new Date(a.next_run_at)-new Date(b.next_run_at))[0];
   $('#workspace-overview').innerHTML=metric('报表定义',state.reports.length,'在左侧选择或新建')+metric('启用的自动计划',enabled.length,'人工运行始终可用')+metric('最近的计划',next?formatTime(next.next_run_at):'未安排',next?.name || '可在生成计划中设置');
@@ -28,7 +29,7 @@ function updatePager(prefix, data, count) {
   $(`#${prefix}-next`).disabled=data.page>=pages;
 }
 function historyQuery() {
-  return new URLSearchParams({page:state.historyPage,page_size:$('#history-page-size').value,q:$('#run-search').value.trim(),status:$('#run-status-filter').value,trigger_type:$('#run-trigger-filter').value});
+  return new URLSearchParams({page:state.historyPage,page_size:$('#history-page-size')?.value || '20',q:$('#run-search')?.value.trim() || '',status:$('#run-status-filter')?.value || '',trigger_type:$('#run-trigger-filter')?.value || '',report_id:state.historyReportId || ''});
 }
 function renderRuns() {
   $('#runs-list').innerHTML=state.runs.map(run=>`<article class="run-row">
@@ -54,6 +55,7 @@ async function loadRuns() {
   } catch(error) {if(request===state.historyRequest) $('#history-message').textContent=`历史加载失败：${error.message}`;}
 }
 async function reuseRun(id) {
+  if(!$('#report-form')) {window.location.href=`/definition?reuse_run=${id}`;return;}
   if(!canLeaveEditor()) return;
   const request=++state.editorRequest, snapshot=JSON.stringify(formPayload());
   try {
@@ -94,6 +96,7 @@ async function loadResultPage() {
   }
 }
 async function viewRun(id) {
+  if(!$('#result-content')) {window.location.href=`/results?run_id=${id}`;return;}
   const request=++state.resultRequest;
   const changed=state.selectedRunId!==id;
   state.selectedRunId=id;
@@ -117,27 +120,26 @@ async function viewRun(id) {
   } catch(error) {if(request===state.resultRequest) $('#result-empty').textContent=`结果加载失败：${error.message}`;}
 }
 document.addEventListener('DOMContentLoaded',()=>{
-  $('#quick-save').addEventListener('click',saveReport);
-  const refreshHistory=()=>{state.historyPage=1; loadRuns();};
-  const refreshResult=()=>{state.resultPage=1; loadResultPage();};
-  $('#run-search').addEventListener('input',debounce(refreshHistory));
-  ['run-status-filter','run-trigger-filter','history-page-size'].forEach(id=>$(`#${id}`).addEventListener('change',refreshHistory));
-  $('#reset-run-filters').addEventListener('click',()=>{['run-search','run-status-filter','run-trigger-filter'].forEach(id=>$(`#${id}`).value=''); refreshHistory();});
-  $('#history-prev').addEventListener('click',()=>{state.historyPage=Math.max(1,state.historyPage-1);loadRuns();});
-  $('#history-next').addEventListener('click',()=>{state.historyPage+=1;loadRuns();});
-  $('#result-search').addEventListener('input',debounce(refreshResult));
-  ['result-sort','result-direction','result-page-size'].forEach(id=>$(`#${id}`).addEventListener('change',refreshResult));
-  $('#reset-result-filters').addEventListener('click',()=>{$('#result-search').value='';$('#result-sort').value='';$('#result-direction').value='asc';refreshResult();});
-  $('#result-prev').addEventListener('click',()=>{state.resultPage=Math.max(1,state.resultPage-1);loadResultPage();});
-  $('#result-next').addEventListener('click',()=>{state.resultPage+=1;loadResultPage();});
-  $('#result-preview').addEventListener('toggle',()=>{if($('#result-preview').open && !$('#result-chart iframe') && state.selectedRunId) $('#result-chart').innerHTML=`<iframe title="HTML 报表结果" src="/api/runs/${state.selectedRunId}/file?format=html"></iframe>`;});
-  $$('.editor-nav a').forEach(link=>link.addEventListener('click',event=>{
-    event.preventDefault(); const target=$(link.getAttribute('href')); if(target.tagName==='DETAILS') target.open=true;
-    target.scrollIntoView({behavior:'smooth',block:'start'});
-  }));
-  $('#expand-editor').addEventListener('click',()=>{
-    const expand=$$('#definition-panel details.editor-section').some(el=>!el.open);
-    $$('#definition-panel details.editor-section').forEach(el=>el.open=expand);
-    $('#expand-editor').textContent=expand?'收起全部':'展开全部';
-  });
+  const bind=(selector,event,handler)=>{const el=$(selector);if(el)el.addEventListener(event,handler);};
+  if($('#report-form')) {
+    bind('#quick-save','click',saveReport);
+    $$('.editor-nav a').forEach(link=>link.addEventListener('click',event=>{event.preventDefault();const target=$(link.getAttribute('href'));if(target?.tagName==='DETAILS')target.open=true;target?.scrollIntoView({behavior:'smooth',block:'start'});}));
+    bind('#expand-editor','click',()=>{const expand=$$('#definition-panel details.editor-section').some(el=>!el.open);$$('#definition-panel details.editor-section').forEach(el=>el.open=expand);$('#expand-editor').textContent=expand?'收起全部':'展开全部';});
+  }
+  if($('#runs-list')) {
+    const refreshHistory=()=>{state.historyPage=1;loadRuns();};
+    const refreshResult=()=>{state.resultPage=1;loadResultPage();};
+    bind('#run-search','input',debounce(refreshHistory));
+    ['run-status-filter','run-trigger-filter','history-page-size'].forEach(id=>bind(`#${id}`,'change',refreshHistory));
+    bind('#reset-run-filters','click',()=>{['run-search','run-status-filter','run-trigger-filter'].forEach(id=>{if($(`#${id}`))$(`#${id}`).value='';});refreshHistory();});
+    bind('#history-prev','click',()=>{state.historyPage=Math.max(1,state.historyPage-1);loadRuns();}); bind('#history-next','click',()=>{state.historyPage+=1;loadRuns();});
+  }
+  if($('#result-content')) {
+    const refreshResult=()=>{state.resultPage=1;loadResultPage();};
+    bind('#result-search','input',debounce(refreshResult));
+    ['result-sort','result-direction','result-page-size'].forEach(id=>bind(`#${id}`,'change',refreshResult));
+    bind('#reset-result-filters','click',()=>{$('#result-search').value='';$('#result-sort').value='';$('#result-direction').value='asc';refreshResult();});
+    bind('#result-prev','click',()=>{state.resultPage=Math.max(1,state.resultPage-1);loadResultPage();}); bind('#result-next','click',()=>{state.resultPage+=1;loadResultPage();});
+    bind('#result-preview','toggle',()=>{if($('#result-preview').open&&!$('#result-chart iframe')&&state.selectedRunId)$('#result-chart').innerHTML=`<iframe title="HTML 报表结果" src="/api/runs/${state.selectedRunId}/file?format=html"></iframe>`;});
+  }
 });

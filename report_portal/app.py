@@ -1612,8 +1612,18 @@ class PortalHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path, query = self.route()
         try:
-            if path in {"/", "/index.html"}:
-                self.send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+            page_files = {
+                "/": "index.html",
+                "/index.html": "index.html",
+                "/definition": "definition.html",
+                "/definition.html": "definition.html",
+                "/results": "results.html",
+                "/results.html": "results.html",
+                "/history": "history.html",
+                "/history.html": "history.html",
+            }
+            if path in page_files:
+                self.send_file(STATIC_DIR / page_files[path], "text/html; charset=utf-8")
             elif path.startswith("/static/"):
                 rel = unquote(path.removeprefix("/static/")).replace("\\", "/")
                 target = (STATIC_DIR / rel).resolve()

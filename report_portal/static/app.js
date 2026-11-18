@@ -1,4 +1,4 @@
-const state = { reports: [], runs: [], selectedId: null, selectedRunId: null, layout: null, selection: null, clipboard: null, dirty: false, preview: null, saving: false, runningRequest: false, defaultTimezone:'Pacific/Auckland', editorRequest:0, activeTab:'definition', historyPage:1, historyRequest:0, resultPage:1, resultRequest:0, resultInfo:null };
+const state = { reports: [], runs: [], selectedId: null, selectedRunId: null, layout: null, selection: null, clipboard: null, dirty: false, preview: null, saving: false, runningRequest: false, defaultTimezone:'Pacific/Auckland', editorRequest:0, historyReportId:new URLSearchParams(location.search).get('report_id') || '', activeTab:'definition', historyPage:1, historyRequest:0, resultPage:1, resultRequest:0, resultInfo:null };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
@@ -43,10 +43,13 @@ async function loadReports(refreshEditor=false) {
   const reports=(await api('/api/reports?summary=1')).items;
   if(JSON.stringify(reports)!==JSON.stringify(state.reports)){ state.reports=reports; renderReports(); }
   renderOverview();
-  if (refreshEditor) fillForm(state.selectedId ? await api(`/api/reports/${state.selectedId}`) : null);
-  else if (!state.layout) fillForm(null);
+  if ($('#report-form')) {
+    if (refreshEditor) fillForm(state.selectedId ? await api(`/api/reports/${state.selectedId}`) : null);
+    else if (!state.layout) fillForm(null);
+  }
 }
 async function selectReport(id) {
+  if (!$('#report-form')) { window.location.href=`/definition?report_id=${id}`; return; }
   if (id===state.selectedId){setTab('definition'); return;}
   if (!canLeaveEditor()) return;
   const request=++state.editorRequest, snapshot=JSON.stringify(formPayload());
@@ -97,15 +100,55 @@ async function runReport() {
     if((state.dirty || !state.selectedId) && !await saveReport()) return;
     if(state.dirty) {toast('定义仍有新修改，请保存后运行'); return;}
     await api(`/api/reports/${state.selectedId}/run`,{method:'POST',body:JSON.stringify({parameters})});
-    toast('人工任务已提交，定时计划保持原定时间'); await loadRuns(); setTab('runs');
+    toast('人工任务已提交，定时计划保持原定时间'); window.location.href=`/history?report_id=${state.selectedId}`;
   } catch(error) {toast(error.message);}
   finally {state.runningRequest=false; $('#run-report').disabled=false;}
 }
-function setTab(name) { state.activeTab=name; $$('.tab').forEach((el) => el.classList.toggle('active', el.dataset.tab === name)); $$('.tab-panel').forEach((el) => el.classList.toggle('active', el.id === `${name}-panel`)); if (name === 'runs') loadRuns().catch(error=>toast(error.message)); }
+function setTab(name) {
+  state.activeTab=name;
+  if (!$('#definition-panel')) {
+    if(name==='definition' && location.pathname!=='/definition') window.location.href=`/definition${state.selectedId ? `?report_id=${state.selectedId}` : ''}`;
+    if(name==='results' && location.pathname!=='/results' && state.selectedRunId) window.location.href=`/results?run_id=${state.selectedRunId}`;
+    if(name==='runs' && location.pathname!=='/history') window.location.href=`/history${state.historyReportId ? `?report_id=${state.historyReportId}` : ''}`;
+    return;
+  }
+  $$('.tab').forEach((el) => el.classList.toggle('active', el.dataset.tab === name));
+  $$('.tab-panel').forEach((el) => el.classList.toggle('active', el.id === `${name}-panel`));
+  if (name === 'runs' && typeof loadRuns === 'function') loadRuns().catch(error=>toast(error.message));
+}
+
 async function loadStatus() { const status = await api('/api/status'); $('#process-label').textContent = status.paused ? '调度器已暂停' : status.running ? '调度器运行中' : '调度器已停止'; $('#process-dot').classList.toggle('live', status.running && !status.paused); $('#active-count').textContent = `${(status.active_runs || []).length} 个运行任务`; $('#database-path').textContent = status.database; state.defaultTimezone=status.default_timezone || state.defaultTimezone; $$('[data-process]').forEach(el => {el.disabled=({start:status.running,stop:!status.running,pause:!status.running || status.paused,resume:status.running && !status.paused})[el.dataset.process];}); }
 async function processAction(action) { try { await api(`/api/process/${action}`, {method:'POST', body:'{}'}); await loadStatus(); toast(`已${{start:'启动',stop:'停止',pause:'暂停',resume:'恢复'}[action]}`); } catch(error) { toast(error.message); } }
 function runParameterSummary(run) { const entries=Object.entries(run.parameters || {}).filter(([,value])=>value !== ''); return entries.length ? ` · 参数：${entries.map(([name,value])=>`${name}=${value}`).join('，')}` : ''; }
-document.addEventListener('DOMContentLoaded', async () => { $$('.tab').forEach((el) => el.addEventListener('click', () => setTab(el.dataset.tab))); $('#new-report').addEventListener('click', () => {if(!canLeaveEditor()) return; ++state.editorRequest; state.selectedId = null; renderReports(); fillForm(null); $('#editor-basic').open=true; $('#editor-query').open=true; setTab('definition');}); $('#save-report').addEventListener('click', saveReport); $('#import-report').addEventListener('click', () => $('#import-file').click()); $('#import-file').addEventListener('change', (event) => { const file=event.target.files?.[0]; if(file) importReport(file); event.target.value=''; }); $('#export-report').addEventListener('click', exportReport); $('#duplicate-report').addEventListener('click', duplicateReport); $('#delete-report').addEventListener('click', deleteReport); $('#run-report').addEventListener('click', runReport); $('#preview-query').addEventListener('click', previewQuery); $('#clear-query-preview').addEventListener('click', () => $('#query-preview').classList.add('hidden')); $('#refresh-runs').addEventListener('click', loadRuns); $('#refresh-results').addEventListener('click', () => state.selectedRunId && viewRun(state.selectedRunId)); $('#copy-cells').addEventListener('click', copyCells); $('#paste-cells').addEventListener('click', pasteCells); $('#merge-cells').addEventListener('click', mergeCells); $('#split-cells').addEventListener('click', splitCells); $('#resize-layout').addEventListener('click', resizeLayout); $('#cell-bold').addEventListener('click', () => applyCellStyle((style)=>{style.bold=!style.bold;})); $('#cell-italic').addEventListener('click', () => applyCellStyle((style)=>{style.italic=!style.italic;})); $('#cell-font-size').addEventListener('change', (event) => applyCellStyle((style)=>{style.fontSize=Number(event.target.value);})); $('#cell-color').addEventListener('change', (event) => applyCellStyle((style)=>{style.color=event.target.value;})); $('#cell-background').addEventListener('change', (event) => applyCellStyle((style)=>{style.background=event.target.value;})); $('#cell-align').addEventListener('change', (event) => applyCellStyle((style)=>{style.align=event.target.value;})); $('#cell-border').addEventListener('change', (event) => applyCellStyle((style)=>{style.border=event.target.value;})); ['name','description','sql','parameters','chart-type','x-column','y-column','schedule','schedule-type','schedule-time','schedule-timezone','enabled','formulas'].forEach((id) => { const el=$(`#${id}`); el.addEventListener('input', markDirty); el.addEventListener('change', markDirty); }); $('#parameters').addEventListener('change', () => renderRunParameters({parameters:parseParameterLines($('#parameters').value)})); ['cell-element','cell-source-type','cell-source-field','cell-source-aggregate','cell-source-chart','cell-source-x','cell-source-y','cell-source-query'].forEach((id) => { const el=$(`#${id}`); el.addEventListener('change', applyDataSourceControls); }); $$('[data-process]').forEach((el) => el.addEventListener('click', () => processAction(el.dataset.process))); document.addEventListener('keydown', (event) => { if((event.ctrlKey || event.metaKey) && event.key.toLowerCase()==='s'){ event.preventDefault(); saveReport(); } if((event.ctrlKey || event.metaKey) && event.key==='Enter'){ event.preventDefault(); runReport(); } }); try { await loadStatus(); await loadReports(); await loadRuns(); } catch(error) { toast(error.message); } let polling=false; setInterval(async () => {if(polling || document.hidden) return; polling=true; try {await Promise.all([loadStatus(),loadReports(),...(state.activeTab==='runs'?[loadRuns()]:[])]);} catch(error) {$('#process-label').textContent='连接中断，正在重试';} finally {polling=false;} }, 5000); });
+document.addEventListener('DOMContentLoaded', async () => {
+  const bind=(selector,event,handler)=>{const el=$(selector); if(el) el.addEventListener(event,handler);};
+  $$('.tab').forEach((el) => el.addEventListener('click', () => setTab(el.dataset.tab)));
+  bind('#new-report','click',()=>{if(!$('#report-form')){window.location.href='/definition';return;} if(!canLeaveEditor()) return; ++state.editorRequest; state.selectedId=null; renderReports(); fillForm(null); $('#editor-basic').open=true; $('#editor-query').open=true; setTab('definition');});
+  bind('#save-report','click',saveReport); bind('#import-report','click',()=>$('#import-file')?.click());
+  bind('#import-file','change',(event)=>{const file=event.target.files?.[0];if(file)importReport(file);event.target.value='';});
+  bind('#export-report','click',exportReport); bind('#duplicate-report','click',duplicateReport); bind('#delete-report','click',deleteReport); bind('#run-report','click',runReport); bind('#preview-query','click',previewQuery); bind('#clear-query-preview','click',()=>$('#query-preview')?.classList.add('hidden'));
+  bind('#refresh-runs','click',()=>typeof loadRuns==='function'&&loadRuns()); bind('#refresh-results','click',()=>state.selectedRunId&&typeof viewRun==='function'&&viewRun(state.selectedRunId));
+  bind('#copy-cells','click',copyCells); bind('#paste-cells','click',pasteCells); bind('#merge-cells','click',mergeCells); bind('#split-cells','click',splitCells); bind('#resize-layout','click',resizeLayout);
+  bind('#cell-bold','click',()=>applyCellStyle(style=>{style.bold=!style.bold;})); bind('#cell-italic','click',()=>applyCellStyle(style=>{style.italic=!style.italic;}));
+  [['#cell-font-size','change',e=>applyCellStyle(style=>{style.fontSize=Number(e.target.value);})],['#cell-color','change',e=>applyCellStyle(style=>{style.color=e.target.value;})],['#cell-background','change',e=>applyCellStyle(style=>{style.background=e.target.value;})],['#cell-align','change',e=>applyCellStyle(style=>{style.align=e.target.value;})],['#cell-border','change',e=>applyCellStyle(style=>{style.border=e.target.value;})]].forEach(([selector,event,handler])=>bind(selector,event,handler));
+  ['name','description','sql','parameters','chart-type','x-column','y-column','schedule','schedule-type','schedule-time','schedule-timezone','enabled','formulas'].forEach(id=>{const el=$(`#${id}`);if(el){el.addEventListener('input',markDirty);el.addEventListener('change',markDirty);}});
+  bind('#parameters','change',()=>renderRunParameters({parameters:parseParameterLines($('#parameters').value)}));
+  ['cell-element','cell-source-type','cell-source-field','cell-source-aggregate','cell-source-chart','cell-source-x','cell-source-y','cell-source-query'].forEach(id=>bind(`#${id}`,'change',applyDataSourceControls));
+  $$('[data-process]').forEach(el=>el.addEventListener('click',()=>processAction(el.dataset.process)));
+  document.addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='s'){event.preventDefault();saveReport();}if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();runReport();}});
+  try {
+    await loadStatus(); await loadReports();
+    if($('#runs-list') && typeof loadRuns==='function') await loadRuns();
+    if($('#report-form')) {
+      const params=new URLSearchParams(location.search); const id=Number(params.get('report_id'));
+      if(id) await selectReport(id);
+      const reuse=params.get('reuse_run');
+      if(reuse && typeof reuseRun==='function') await reuseRun(Number(reuse));
+    }
+    if($('#result-content')) {const runId=Number(new URLSearchParams(location.search).get('run_id')); if(runId && typeof viewRun==='function') await viewRun(runId);}
+  } catch(error) { toast(error.message); }
+  let polling=false; setInterval(async()=>{if(polling||document.hidden)return;polling=true;try{await Promise.all([loadStatus(),loadReports(),...($('#runs-list')&&typeof loadRuns==='function'?[loadRuns()]:[])]);}catch(error){$('#process-label')?.replaceChildren(document.createTextNode('连接中断，正在重试'));}finally{polling=false;}},5000);
+});
 
 function canLeaveEditor() {return !state.saving && (!state.dirty || confirm('有未保存的修改，确定放弃这些修改吗？'));}
 function scheduleSummary(report) {
@@ -125,6 +168,7 @@ function syncScheduleControls() {
   $('#schedule-summary').textContent=scheduleSummary(formPayload()) + (report?.next_run_at?`。已保存计划下次执行（本地）：${formatTime(report.next_run_at)}`:'') + '。暂停或停止只影响自动调度，已开始的任务继续完成。';
 }
 document.addEventListener('DOMContentLoaded',()=>{
+  if(!$('#report-form')) return;
   ['schedule-type','schedule','schedule-time','schedule-timezone','enabled'].forEach(id=>$(`#${id}`).addEventListener('change',syncScheduleControls));
   $('#report-search').addEventListener('input',renderReports);
   $$('#report-form input[type=checkbox][value]').forEach(el=>el.addEventListener('change',markDirty));

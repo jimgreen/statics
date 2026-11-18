@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>报表定义 - 报表控制台</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><div class="eyebrow">REPORT PORTAL / SQLITE</div><h1>报表控制台</h1></div>
+    <div class="process-card"><span id="process-dot" class="dot"></span><span id="process-label">调度器加载中</span><span id="active-count" class="process-count">0 个运行任务</span><button class="ghost" data-process="start">启动</button><button class="ghost" data-process="pause">暂停</button><button class="ghost" data-process="resume">恢复</button><button class="ghost" data-process="stop">停止</button></div>
+  </header>
+  <main class="layout">
+    <aside class="sidebar"><div class="sidebar-title"><span>报表定义</span><button id="new-report" class="primary small">＋ 新建</button></div><input id="report-search" type="search" aria-label="搜索报表" placeholder="搜索名称或说明"><div id="report-list" class="report-list"></div><div class="sidebar-foot"><span class="status-pill">● SQLite</span><span id="database-path"></span></div></aside>
+    <section class="workspace">
+      <div id="workspace-overview" class="workspace-overview" aria-label="报表概况"></div>
+      <nav class="page-nav" aria-label="报表功能页面"><a class="active" href="/definition">报表定义</a><a class="" href="/results">运行结果</a><a class="" href="/history">执行历史</a></nav>
+            <section id="definition-panel" class="panel page-panel">
+        <div class="panel-heading"><div><div class="eyebrow">DEFINITION</div><h2 id="editor-title">新建报表</h2><div id="dirty-indicator" class="dirty-indicator hidden">有未保存修改</div></div><div class="actions"><button id="import-report" class="ghost">导入定义</button><input id="import-file" type="file" accept="application/json,.json" hidden><button id="export-report" class="ghost">导出定义</button><button id="duplicate-report" class="ghost" disabled>复制报表</button><button id="delete-report" class="danger ghost" disabled>删除</button><button id="save-report" class="primary">保存定义</button></div></div>
+        <nav class="editor-nav" aria-label="定义分区">
+          <a href="#editor-basic">基本资料</a><a href="#editor-query">数据与参数</a><a href="#editor-schedule">生成计划</a><a href="#editor-formulas">统计公式</a><a href="#editor-layout">版式设计</a><a href="#editor-run">立即生成</a>
+          <button type="button" class="ghost small" id="expand-editor">展开全部</button>
+          <button type="button" class="primary small" id="quick-save">保存修改</button>
+        </nav>
+        <form id="report-form">
+          <details class="editor-section" id="editor-basic" open><summary>基本资料 <span>名称、说明与主图表</span></summary><div class="form-grid">
+            <label>报表名称<input id="name" required maxlength="120" placeholder="例如：月度销售分析"></label>
+            <label>图表类型<select id="chart-type"><option value="table">表格</option><option value="line">折线图</option><option value="bar">柱状图</option><option value="pie">饼图</option></select></label>
+            <label class="wide">说明<textarea id="description" rows="2" placeholder="这份报表给谁看，用来回答什么问题？"></textarea></label>
+            </div></details><details class="editor-section" id="editor-query" open><summary>数据查询与运行参数 <span>只读 SQL、参数和字段</span></summary><div class="form-grid"><label class="wide">SQL 查询<textarea id="sql" rows="4" spellcheck="false" required placeholder="SELECT month, SUM(amount) AS amount FROM demo_sales GROUP BY month ORDER BY month"></textarea><div class="sql-tools"><span class="hint">只允许 SELECT / WITH / EXPLAIN 查询；结果首列作为横轴，第二列作为数值。</span><button type="button" class="ghost small" id="preview-query">预览查询</button><label class="preview-limit">预览行数<select id="preview-limit"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option></select></label></div></label>
+            <label class="wide">报表参数<textarea id="parameters" rows="4" spellcheck="false" placeholder="start_date | 开始日期 | date | 2026-01-01 | 否
+end_date | 结束日期 | date | 2026-12-31 | 否
+region | 区域 | select | 华东 | 否 | 华东,华南"></textarea><span class="hint">SQL 使用 SQLite 命名参数，例如 <code>WHERE day &gt;= :start_date AND region = :region</code>。每行格式：参数名 | 显示名称 | 类型(text/date/number/select) | 默认值 | 是否必填 | 下拉选项。</span></label>
+            <label>横轴列<input id="x-column" placeholder="month"></label>
+            <label>数值列<input id="y-column" placeholder="amount"></label>
+            </div></details><details class="editor-section" id="editor-schedule"><summary>生成计划与输出 <span>定时规则、时区和文件格式</span></summary><div class="form-grid"><label>调度方式<select id="schedule-type"><option value="manual">仅手动运行</option><option value="interval">按间隔运行</option><option value="daily">每天指定时间</option></select><span class="hint">人工运行始终可用；定时任务使用参数默认值。</span></label>
+            <label id="schedule-minutes-label">间隔（分钟）<input id="schedule" type="number" min="1" step="1" value="60"><span class="hint">按间隔运行时至少 1 分钟。</span></label>
+            <label id="schedule-time-label" class="hidden">每日运行时间<input id="schedule-time" type="time" value="08:00"></label>
+            <label id="schedule-timezone-label" class="hidden">每日计划时区<input id="schedule-timezone" list="schedule-zones" value="Pacific/Auckland"><datalist id="schedule-zones"><option value="Pacific/Auckland">新西兰</option><option value="Asia/Shanghai">中国</option><option value="UTC">UTC</option><option value="Australia/Sydney">悉尼</option></datalist><span class="hint">每日时间按此时区计算，自动适应夏令时。</span></label>
+            <fieldset><legend>运行选项</legend><label class="check"><input id="enabled" type="checkbox" checked> 启用自动调度</label></fieldset>
+            <div class="wide schedule-summary" id="schedule-summary" aria-live="polite"></div>
+            <fieldset><legend>输出格式</legend><label class="check"><input type="checkbox" value="html" checked> HTML</label><label class="check"><input type="checkbox" value="xlsx" checked> Excel</label><label class="check"><input type="checkbox" value="docx"> Word</label><label class="check"><input type="checkbox" value="csv"> CSV</label></fieldset>
+            </div></details><details class="editor-section" id="editor-formulas"><summary>统计公式 <span>最大值、平均值、积分等</span></summary><div class="form-grid"><label class="wide">统计公式（每行一条）<textarea id="formulas" rows="5" spellcheck="false" placeholder="最大值 = MAX(amount)
+最小值 = MIN(amount)
+平均值 = AVERAGE(amount)
+积分值 = INTEGRAL(amount, month)"></textarea><span class="hint">支持 MAX、MIN、AVERAGE、SUM、COUNT 和 INTEGRAL；也支持 Excel 单元格范围，如 <code>=MAX(B2:B100)</code>、<code>=INTEGRAL(B2:B100,A2:A100)</code>。</span></label>
+          </div>
+          </details><div id="form-message" class="message"></div>
+        </form>
+        <section id="query-preview" class="query-preview hidden"><div class="query-preview-heading"><div><strong>查询预览</strong><span id="query-preview-meta"></span></div><button type="button" class="ghost small" id="clear-query-preview">收起</button></div><div id="query-preview-table" class="table-wrap"></div></section>
+        <details class="editor-section designer-section" id="editor-layout"><summary>版式设计 <span>单元格样式、独立数据源、表格与图表</span></summary>
+          <div class="designer-heading"><div><div class="eyebrow">LAYOUT DESIGNER</div><h3>报表版式</h3><p>编辑单元格内容和样式；按住 Shift 点击可选择区域。支持 Ctrl+S 保存、Ctrl+Enter 运行。</p></div><div class="designer-actions"><label class="grid-size">行数<input id="layout-rows" type="number" min="1" max="30" value="8"></label><label class="grid-size">列数<input id="layout-cols" type="number" min="1" max="20" value="8"></label><button type="button" class="ghost small" id="resize-layout">应用网格</button><button type="button" class="ghost small" id="copy-cells">复制区域</button><button type="button" class="ghost small" id="paste-cells">粘贴区域</button><button type="button" class="ghost small" id="merge-cells">合并单元格</button><button type="button" class="ghost small" id="split-cells">拆分单元格</button></div></div>
+          <div class="designer-toolbar"><label>字号<select id="cell-font-size"><option>11</option><option selected>13</option><option>16</option><option>20</option><option>24</option></select></label><button type="button" class="ghost small" id="cell-bold">粗体</button><button type="button" class="ghost small" id="cell-italic">斜体</button><label>文字色<input id="cell-color" type="color" value="#172033"></label><label>填充色<input id="cell-background" type="color" value="#ffffff"></label><label>对齐<select id="cell-align"><option value="left">左对齐</option><option value="center">居中</option><option value="right">右对齐</option></select></label><label>线型<select id="cell-border"><option value="thin">细线</option><option value="medium">粗线</option><option value="dashed">虚线</option><option value="none">无框线</option></select></label></div>
+          <div class="element-source-toolbar">
+            <label>元素类型<select id="cell-element"><option value="text">文本</option><option value="value">数值/字段</option><option value="table">动态表格</option><option value="chart">图表控件</option></select></label>
+            <label>数据源<select id="cell-source-type"><option value="static">静态内容</option><option value="report_field">主查询字段</option><option value="sql">独立 SQL 查询</option><option value="formula">统计公式</option></select></label>
+            <label>字段<input id="cell-source-field" placeholder="amount"></label>
+            <label>聚合<select id="cell-source-aggregate"><option value="first">首个值</option><option value="sum">求和</option><option value="avg">平均</option><option value="min">最小</option><option value="max">最大</option><option value="count">计数</option></select></label>
+            <label>图表<select id="cell-source-chart"><option value="line">折线</option><option value="bar">柱状</option><option value="pie">饼图</option></select></label>
+            <label>X 轴字段<input id="cell-source-x" placeholder="month"></label>
+            <label>Y 轴字段<input id="cell-source-y" placeholder="amount"></label>
+            <label class="element-source-wide">独立 SQL / 公式<textarea id="cell-source-query" rows="3" spellcheck="false" placeholder="SELECT month, amount FROM demo_sales ORDER BY month 或 =MAX(amount)"></textarea></label>
+            <span class="hint element-source-wide">先选中网格单元格，再定义它自己的数据源。动态表格不需要预先填写行数，会按 SQL 返回结果展开。</span>
+          </div>
+          <div id="layout-grid" class="layout-grid" aria-label="报表版式网格"></div>
+        </details>
+        <div class="run-strip" id="editor-run"><div class="run-copy"><strong>立即生成</strong><span>保存当前定义后生成；本次参数仅用于人工运行。人工运行不改变定时计划。</span></div><div id="run-parameters" class="run-parameters hidden"></div><button id="run-report" class="primary">保存并运行</button></div>
+      </section>
+
+    </section>
+  </main>
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js"></script><script src="/static/workbench.js"></script>
+</body>
+</html>

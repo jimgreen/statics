@@ -4,6 +4,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
+from urllib.request import Request, urlopen
 
 import test_scheduling as fixtures
 from report_portal import app
@@ -106,6 +107,25 @@ class PortalBrowsing(unittest.TestCase):
         self.create(schedule_type='manual')
         with patch.object(app, 'row_to_report', side_effect=AssertionError('decoded idle definition')):
             self.scheduler.dispatch_due()
+
+    def test_page_routes_are_independent_html_documents(self):
+        pages = {
+            '/definition': ('报表定义', 'definition-panel', ['results-panel', 'runs-panel']),
+            '/results': ('运行结果', 'results-panel', ['definition-panel', 'runs-panel']),
+            '/history': ('执行历史', 'runs-panel', ['definition-panel', 'results-panel']),
+        }
+        for path, (title, own_panel, absent_panels) in pages.items():
+            request = Request(self.url + path)
+            with urlopen(request) as response:
+                html = response.read().decode('utf-8')
+                self.assertEqual(response.status, 200)
+                self.assertIn(f'<title>{title} - 报表控制台</title>', html)
+                self.assertIn(f'id="{own_panel}"', html)
+                for absent in absent_panels:
+                    self.assertNotIn(f'id="{absent}"', html)
+        with urlopen(self.url + '/') as response:
+            root = response.read().decode('utf-8')
+            self.assertIn("location.replace('/definition'+location.search)", root)
 
 
 if __name__ == '__main__':
