@@ -38,7 +38,7 @@ if not DB_PATH.is_absolute():
 
 UTC = timezone.utc
 ALLOWED_CHARTS = {"table", "bar", "line", "pie"}
-ALLOWED_FORMATS = {"html", "xlsx", "csv"}
+ALLOWED_FORMATS = {"html", "xlsx", "csv", "docx"}
 
 
 def utc_now() -> datetime:
@@ -211,6 +211,11 @@ def row_to_report(row: sqlite3.Row) -> dict[str, Any]:
 def row_to_run(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
     result["report_name"] = result.pop("report_name", None)
+    raw_formats = result.pop("report_output_formats", "[]")
+    try:
+        result["output_formats"] = json.loads(raw_formats or "[]")
+    except json.JSONDecodeError:
+        result["output_formats"] = []
     return result
 
 
@@ -218,6 +223,35 @@ def get_report(report_id: int) -> dict[str, Any] | None:
     with connection() as conn:
         row = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
     return row_to_report(row) if row else None
+
+
+def duplicate_report(report_id: int) -> dict[str, Any]:
+    source = get_report(report_id)
+    if not source:
+        raise ValueError("报表不存在")
+    base_name = f"{source['name']} - 副本"
+    name = base_name
+    suffix = 2
+    while True:
+        with connection() as conn:
+            exists = conn.execute("SELECT 1 FROM reports WHERE name=?", (name,)).fetchone()
+        if not exists:
+            break
+        name = f"{base_name} {suffix}"
+        suffix += 1
+    now = utc_now()
+    with connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO reports
+            (name, description, sql, chart_type, x_column, y_column, formulas, layout,
+             output_formats, schedule_minutes, enabled, created_at, updated_at, next_run_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (name, source["description"], source["sql"], source["chart_type"], source["x_column"], source["y_column"], json.dumps(source["formulas"], ensure_ascii=False), json.dumps(source["layout"], ensure_ascii=False), json.dumps(source["output_formats"], ensure_ascii=False), 0, 0, iso(now), iso(now), None),
+        )
+        new_id = cursor.lastrowid
+    return get_report(new_id) or {"id": new_id, "name": name}
 
 
 def normalize_formulas(value: Any) -> list[dict[str, str]]:
@@ -362,7 +396,7 @@ def validate_report_payload(payload: dict[str, Any], existing_id: int | None = N
         formats = [item.strip() for item in formats.split(",") if item.strip()]
     formats = list(dict.fromkeys(str(item) for item in formats))
     if not formats or any(item not in ALLOWED_FORMATS for item in formats):
-        raise ValueError("输出格式只能是 html、xlsx 或 csv")
+        raise ValueError("输出格式只能是 html、xlsx、csv 或 docx")
     formulas = normalize_formulas(payload.get("formulas", []))
     layout = normalize_layout(payload.get("layout"))
     return {
@@ -392,13 +426,40 @@ def run_rows(limit: int = 100) -> list[dict[str, Any]]:
     with connection() as conn:
         rows = conn.execute(
             """
-            SELECT runs.*, reports.name AS report_name
+            SELECT runs.*, reports.name AS report_name, reports.output_formats AS report_output_formats
             FROM runs JOIN reports ON reports.id = runs.report_id
             ORDER BY runs.started_at DESC LIMIT ?
             """,
             (limit,),
         ).fetchall()
     return [row_to_run(row) for row in rows]
+
+
+def preview_query(sql: str, limit: int = 50) -> dict[str, Any]:
+    """Execute a bounded, read-only preview for the definition editor."""
+
+    sql = str(sql or "").strip()
+    normalized = sql.lower().lstrip()
+    if not (normalized.startswith("select") or normalized.startswith("with") or normalized.startswith("explain")):
+        raise ValueError("只允许 SELECT、WITH 或 EXPLAIN 查询")
+    if ";" in sql.rstrip(";"):
+        raise ValueError("不允许执行多条 SQL")
+    limit = min(max(int(limit or 50), 1), 200)
+    started = time.perf_counter()
+    with connection() as conn:
+        conn.execute("PRAGMA query_only = ON")
+        cursor = conn.execute(sql.rstrip(";"))
+        raw_rows = cursor.fetchmany(limit + 1)
+        columns = [description[0] for description in (cursor.description or [])]
+    truncated = len(raw_rows) > limit
+    rows = [{column: json_value(row[column]) for column in columns} for row in raw_rows[:limit]]
+    return {
+        "columns": columns,
+        "rows": rows,
+        "row_count": len(rows),
+        "truncated": truncated,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+    }
 
 
 def safe_column(row: dict[str, Any], name: str, fallback_index: int) -> Any:
@@ -743,6 +804,102 @@ def render_html(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int,
 </body></html>"""
 
 
+def layout_cell_text(cell: dict[str, Any], report_rows: list[dict[str, Any]]) -> str:
+    """Return a plain-text representation of a designed cell for Word output."""
+
+    source = dict(cell.get("data_source") or {})
+    source.setdefault("value", cell.get("value", ""))
+    element = cell.get("element", "text")
+    if element == "table":
+        data_rows = cell_data_rows(source, report_rows)
+        if not data_rows:
+            return str(cell.get("value", "") or "暂无数据")
+        columns = list(data_rows[0].keys())
+        lines = [" | ".join(str(column) for column in columns)]
+        lines.extend(" | ".join(str(row.get(column, "")) for column in columns) for row in data_rows[:30])
+        if len(data_rows) > 30:
+            lines.append(f"… 共 {len(data_rows)} 行")
+        return "\n".join(lines)
+    if element == "chart":
+        data_rows = cell_data_rows(source, report_rows)
+        chart_type = {"line": "折线图", "bar": "柱状图", "pie": "饼图"}.get(source.get("chart_type"), "图表")
+        return f"[{chart_type}，{len(data_rows)} 行数据]"
+    value = execute_data_source(source, report_rows)
+    return str(value if value is not None else cell.get("value", ""))
+
+
+def write_docx(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, summaries: list[dict[str, Any]], output_path: Path) -> None:
+    """Generate a readable Word report while keeping the source data tabular."""
+
+    try:
+        from docx import Document
+        from docx.enum.table import WD_TABLE_ALIGNMENT
+        from docx.shared import Inches, Pt
+    except ImportError as exc:  # pragma: no cover - dependency is declared in requirements
+        raise RuntimeError("生成 Word 需要安装 python-docx，请执行 pip install python-docx") from exc
+
+    document = Document()
+    section = document.sections[0]
+    section.top_margin = Inches(0.6)
+    section.bottom_margin = Inches(0.6)
+    section.left_margin = Inches(0.65)
+    section.right_margin = Inches(0.65)
+    document.add_heading(report["name"], 0)
+    if report.get("description"):
+        document.add_paragraph(report["description"])
+    meta = document.add_paragraph()
+    meta.add_run(f"运行编号：{run_id}    数据行数：{len(rows)}").bold = True
+
+    if summaries:
+        document.add_heading("统计值", level=1)
+        summary_table = document.add_table(rows=1, cols=3)
+        summary_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        summary_table.style = "Table Grid"
+        for cell, text in zip(summary_table.rows[0].cells, ("指标", "公式", "结果")):
+            cell.text = text
+        for item in summaries:
+            cells = summary_table.add_row().cells
+            cells[0].text = str(item.get("name", ""))
+            cells[1].text = str(item.get("formula", ""))
+            cells[2].text = str(item.get("value", ""))
+
+    layout = report.get("layout") or {}
+    if layout.get("cells") or layout.get("merges"):
+        document.add_heading("报表版式", level=1)
+        layout_table = document.add_table(rows=layout.get("rows", 8), cols=layout.get("cols", 8))
+        layout_table.style = "Table Grid"
+        layout_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for row in range(layout.get("rows", 8)):
+            for col in range(layout.get("cols", 8)):
+                key = f"r{row}c{col}"
+                cell_def = (layout.get("cells") or {}).get(key, {})
+                layout_table.cell(row, col).text = layout_cell_text(cell_def, rows)
+        for merge in layout.get("merges", []):
+            start = layout_table.cell(merge["row"], merge["col"])
+            end = layout_table.cell(merge["row"] + merge["rowspan"] - 1, merge["col"] + merge["colspan"] - 1)
+            start.merge(end)
+
+    document.add_heading("数据明细", level=1)
+    columns = list(rows[0].keys()) if rows else []
+    if columns:
+        data_table = document.add_table(rows=1, cols=len(columns))
+        data_table.style = "Table Grid"
+        data_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for cell, column in zip(data_table.rows[0].cells, columns):
+            cell.text = str(column)
+        for row in rows:
+            cells = data_table.add_row().cells
+            for cell, column in zip(cells, columns):
+                cell.text = str(row.get(column, ""))
+    else:
+        document.add_paragraph("查询没有返回数据。")
+    for paragraph in document.paragraphs:
+        for run in paragraph.runs:
+            run.font.name = "Microsoft YaHei"
+            run.font.size = Pt(10)
+    document.save(output_path)
+
+
 def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, summaries: list[dict[str, Any]]) -> Path:
     output_dir = OUTPUT_DIR / f"run-{run_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -760,6 +917,8 @@ def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: in
             if columns:
                 writer.writeheader()
                 writer.writerows(rows)
+    if "docx" in formats:
+        write_docx(report, rows, run_id, summaries, output_dir / "report.docx")
     if "xlsx" in formats:
         try:
             from openpyxl import Workbook
@@ -922,7 +1081,7 @@ def execute_report(report_id: int) -> dict[str, Any]:
 def get_run(run_id: int) -> dict[str, Any] | None:
     with connection() as conn:
         row = conn.execute(
-            "SELECT runs.*, reports.name AS report_name FROM runs JOIN reports ON reports.id=runs.report_id WHERE runs.id=?",
+            "SELECT runs.*, reports.name AS report_name, reports.output_formats AS report_output_formats FROM runs JOIN reports ON reports.id=runs.report_id WHERE runs.id=?",
             (run_id,),
         ).fetchone()
     return row_to_run(row) if row else None
@@ -1086,7 +1245,7 @@ class PortalHandler(BaseHTTPRequestHandler):
                     self.send_file(summary_path, "application/json; charset=utf-8")
                 elif len(parts) >= 5 and parts[4] == "file":
                     fmt = query.get("format", ["html"])[0]
-                    mapping = {"html": ("report.html", "text/html; charset=utf-8"), "xlsx": ("report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"), "csv": ("report.csv", "text/csv; charset=utf-8")}
+                    mapping = {"html": ("report.html", "text/html; charset=utf-8"), "xlsx": ("report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"), "csv": ("report.csv", "text/csv; charset=utf-8"), "docx": ("report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")}
                     if fmt not in mapping:
                         raise ValueError("不支持的文件格式")
                     filename, content_type = mapping[fmt]
@@ -1120,6 +1279,8 @@ class PortalHandler(BaseHTTPRequestHandler):
             elif path == "/api/process/resume":
                 SCHEDULER.resume()
                 self.send_json(SCHEDULER.status())
+            elif path == "/api/query/preview":
+                self.send_json(preview_query(payload.get("sql", ""), payload.get("limit", 50)))
             elif path == "/api/reports":
                 data = validate_report_payload(payload)
                 now = utc_now()
@@ -1136,6 +1297,9 @@ class PortalHandler(BaseHTTPRequestHandler):
                     )
                     report_id = cursor.lastrowid
                 self.send_json(get_report(report_id), HTTPStatus.CREATED)
+            elif path.endswith("/duplicate") and path.startswith("/api/reports/"):
+                report_id = parse_id(path.split("/")[3])
+                self.send_json(duplicate_report(report_id), HTTPStatus.CREATED)
             elif path.endswith("/run") and path.startswith("/api/reports/"):
                 report_id = parse_id(path.split("/")[3])
                 if not get_report(report_id):
