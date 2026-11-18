@@ -17,17 +17,19 @@ import re
 import sqlite3
 import threading
 import time
+import tempfile
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
-OUTPUT_DIR = ROOT / "output"
+OUTPUT_DIR = Path(os.environ.get("REPORT_OUTPUT_DIR", str(ROOT / "output"))).resolve()
 STATIC_DIR = ROOT / "static"
 DEFAULT_DB_DIR = Path(
     os.environ.get("REPORT_DB_DIR", r"D:\codex\sqldb\realtime\statics")
@@ -39,6 +41,9 @@ if not DB_PATH.is_absolute():
 UTC = timezone.utc
 ALLOWED_CHARTS = {"table", "bar", "line", "pie"}
 ALLOWED_FORMATS = {"html", "xlsx", "csv", "docx"}
+ALLOWED_SCHEDULE_TYPES = {"manual", "interval", "daily"}
+DEFAULT_TIMEZONE = os.environ.get("REPORT_TIMEZONE", "Pacific/Auckland")
+SCHEDULE_FIELDS = ("schedule_type", "schedule_minutes", "schedule_time", "schedule_timezone", "enabled")
 
 
 def utc_now() -> datetime:
@@ -70,9 +75,17 @@ def json_value(value: Any) -> Any:
         return str(value)
 
 
+class PortalConnection(sqlite3.Connection):
+    def __exit__(self, *args: Any) -> Any:
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
+
+
 def connection() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn = sqlite3.connect(DB_PATH, timeout=20, factory=PortalConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -131,6 +144,8 @@ def init_db() -> None:
                 layout TEXT NOT NULL DEFAULT '{}',
                 output_formats TEXT NOT NULL DEFAULT '["html", "xlsx"]',
                 schedule_minutes INTEGER NOT NULL DEFAULT 0,
+                schedule_type TEXT NOT NULL DEFAULT 'manual',
+                schedule_time TEXT NOT NULL DEFAULT '',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -159,9 +174,24 @@ def init_db() -> None:
             conn.execute("ALTER TABLE reports ADD COLUMN parameters TEXT NOT NULL DEFAULT '[]'")
         if "layout" not in columns:
             conn.execute("ALTER TABLE reports ADD COLUMN layout TEXT NOT NULL DEFAULT '{}'")
+        if "schedule_type" not in columns:
+            conn.execute("ALTER TABLE reports ADD COLUMN schedule_type TEXT NOT NULL DEFAULT 'manual'")
+            conn.execute("UPDATE reports SET schedule_type='interval' WHERE schedule_minutes > 0")
+        if "schedule_time" not in columns:
+            conn.execute("ALTER TABLE reports ADD COLUMN schedule_time TEXT NOT NULL DEFAULT ''")
+        if "schedule_timezone" not in columns:
+            conn.execute("ALTER TABLE reports ADD COLUMN schedule_timezone TEXT NOT NULL DEFAULT ''")
+            conn.execute("UPDATE reports SET schedule_timezone=?", (DEFAULT_TIMEZONE,))
         run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
         if "parameters" not in run_columns:
             conn.execute("ALTER TABLE runs ADD COLUMN parameters TEXT NOT NULL DEFAULT '{}'")
+        for field, declaration in {
+            "trigger_type": "TEXT NOT NULL DEFAULT 'legacy'",
+            "scheduled_for": "TEXT",
+            "schedule_snapshot": "TEXT NOT NULL DEFAULT '{}'",
+        }.items():
+            if field not in run_columns:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN {field} {declaration}")
         seed_demo_database(conn)
         demo_formulas = json.dumps([
             {"name": "最大值", "formula": "=MAX(amount)"},
@@ -178,9 +208,9 @@ def init_db() -> None:
             conn.execute(
                 """
                 INSERT INTO reports
-                (name, description, sql, chart_type, x_column, y_column, formulas, layout,
-                 output_formats, schedule_minutes, enabled, created_at, updated_at, next_run_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (name, description, sql, chart_type, x_column, y_column, formulas, parameters, layout,
+                 output_formats, schedule_minutes, schedule_type, schedule_time, enabled, created_at, updated_at, next_run_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "销售趋势示例",
@@ -195,9 +225,12 @@ def init_db() -> None:
                         {"name": "平均值", "formula": "=AVERAGE(amount)"},
                         {"name": "积分值", "formula": "=INTEGRAL(amount, month)"},
                     ], ensure_ascii=False),
+                    json.dumps([], ensure_ascii=False),
                     json.dumps(normalize_layout(None), ensure_ascii=False),
                     json.dumps(["html", "xlsx"], ensure_ascii=False),
                     0,
+                    "manual",
+                    "",
                     1,
                     iso(now),
                     iso(now),
@@ -212,8 +245,43 @@ def row_to_report(row: sqlite3.Row) -> dict[str, Any]:
     result["parameters"] = normalize_parameters(result.get("parameters") or "[]")
     result["layout"] = normalize_layout(result.get("layout") or "{}")
     result["output_formats"] = json.loads(result.get("output_formats") or "[]")
+    schedule_type = str(result.get("schedule_type") or "").lower()
+    if schedule_type not in ALLOWED_SCHEDULE_TYPES:
+        schedule_type = "interval" if int(result.get("schedule_minutes") or 0) > 0 else "manual"
+    result["schedule_type"] = schedule_type
+    result["schedule_time"] = str(result.get("schedule_time") or "")
+    result["schedule_timezone"] = result.get("schedule_timezone") or DEFAULT_TIMEZONE
     result["enabled"] = bool(result["enabled"])
     return result
+
+
+def next_schedule_run(report: dict[str, Any], base: datetime | None = None) -> datetime | None:
+    """Calculate the next automatic execution time for a report."""
+
+    if not report.get("enabled", True):
+        return None
+    base = (base or utc_now()).astimezone(UTC)
+    schedule_type = str(report.get("schedule_type") or "manual").lower()
+    if schedule_type == "interval":
+        minutes = int(report.get("schedule_minutes") or 0)
+        return base + timedelta(minutes=minutes) if minutes > 0 else None
+    if schedule_type == "daily":
+        try:
+            hour, minute = (int(part) for part in str(report.get("schedule_time", "")).split(":", 1))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                return None
+        except (TypeError, ValueError):
+            return None
+        zone = ZoneInfo(report.get("schedule_timezone") or DEFAULT_TIMEZONE)
+        local = base.astimezone(zone)
+        for offset in range(3):
+            # fold=0 selects the first occurrence of a repeated local time.
+            # UTC roundtrip moves a nonexistent time forward by the DST gap.
+            day = local.date() + timedelta(days=offset)
+            candidate = datetime(day.year, day.month, day.day, hour, minute, tzinfo=zone, fold=0).astimezone(UTC)
+            if candidate > base:
+                return candidate
+    return None
 
 
 def row_to_run(row: sqlite3.Row) -> dict[str, Any]:
@@ -224,11 +292,15 @@ def row_to_run(row: sqlite3.Row) -> dict[str, Any]:
         result["output_formats"] = json.loads(raw_formats or "[]")
     except json.JSONDecodeError:
         result["output_formats"] = []
+    if result.get("output_dir"):
+        directory = Path(result["output_dir"])
+        result["output_formats"] = [fmt for fmt in sorted(ALLOWED_FORMATS) if (directory / f"report.{fmt}").is_file()]
     raw_parameters = result.get("parameters", "{}")
     try:
         result["parameters"] = json.loads(raw_parameters or "{}")
     except json.JSONDecodeError:
         result["parameters"] = {}
+    result["schedule_snapshot"] = json.loads(result.get("schedule_snapshot") or "{}")
     return result
 
 
@@ -258,10 +330,10 @@ def duplicate_report(report_id: int) -> dict[str, Any]:
             """
             INSERT INTO reports
             (name, description, sql, chart_type, x_column, y_column, formulas, parameters, layout,
-             output_formats, schedule_minutes, enabled, created_at, updated_at, next_run_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             output_formats, schedule_minutes, schedule_type, schedule_time, schedule_timezone, enabled, created_at, updated_at, next_run_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (name, source["description"], source["sql"], source["chart_type"], source["x_column"], source["y_column"], json.dumps(source["formulas"], ensure_ascii=False), json.dumps(source["parameters"], ensure_ascii=False), json.dumps(source["layout"], ensure_ascii=False), json.dumps(source["output_formats"], ensure_ascii=False), 0, 0, iso(now), iso(now), None),
+            (name, source["description"], source["sql"], source["chart_type"], source["x_column"], source["y_column"], json.dumps(source["formulas"], ensure_ascii=False), json.dumps(source["parameters"], ensure_ascii=False), json.dumps(source["layout"], ensure_ascii=False), json.dumps(source["output_formats"], ensure_ascii=False), source["schedule_minutes"], source["schedule_type"], source["schedule_time"], source["schedule_timezone"], 0, iso(now), iso(now), None),
         )
         new_id = cursor.lastrowid
     return get_report(new_id) or {"id": new_id, "name": name}
@@ -520,8 +592,33 @@ def validate_report_payload(payload: dict[str, Any], existing_id: int | None = N
         schedule_minutes = max(0, int(payload.get("schedule_minutes", 0) or 0))
     except (TypeError, ValueError) as exc:
         raise ValueError("调度间隔必须是非负整数分钟") from exc
-    if schedule_minutes and schedule_minutes < 1:
-        raise ValueError("调度间隔至少为 1 分钟")
+    schedule_type = str(payload.get("schedule_type", "")).strip().lower()
+    if not schedule_type:
+        schedule_type = "interval" if schedule_minutes else "manual"
+    if schedule_type not in ALLOWED_SCHEDULE_TYPES:
+        raise ValueError("调度方式只能是 manual、interval 或 daily")
+    schedule_time = str(payload.get("schedule_time", "")).strip()
+    if schedule_type == "interval":
+        if schedule_minutes < 1:
+            raise ValueError("按间隔运行时，调度间隔至少为 1 分钟")
+        schedule_time = ""
+    elif schedule_type == "daily":
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", schedule_time):
+            raise ValueError("每天定时必须填写有效时间，例如 08:30")
+        schedule_minutes = 0
+    else:
+        schedule_minutes = 0
+        schedule_time = ""
+    schedule_timezone = str(payload.get("schedule_timezone") or DEFAULT_TIMEZONE).strip()
+    try:
+        ZoneInfo(schedule_timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError("无效时区，请使用 Pacific/Auckland、Asia/Shanghai 等 IANA 时区名称") from exc
+    if schedule_type != "manual" and payload.get("enabled", True):
+        try:
+            normalize_run_parameters({"parameters": parameters})
+        except ValueError as exc:
+            raise ValueError(f"启用自动调度前请填写有效的参数默认值：{exc}") from exc
     formats = payload.get("output_formats", ["html", "xlsx"])
     if isinstance(formats, str):
         formats = [item.strip() for item in formats.split(",") if item.strip()]
@@ -549,6 +646,9 @@ def validate_report_payload(payload: dict[str, Any], existing_id: int | None = N
         "layout": layout,
         "output_formats": formats,
         "schedule_minutes": schedule_minutes,
+        "schedule_type": schedule_type,
+        "schedule_time": schedule_time,
+        "schedule_timezone": schedule_timezone,
         "enabled": bool(payload.get("enabled", True)),
     }
 
@@ -567,7 +667,7 @@ def run_rows(limit: int = 100) -> list[dict[str, Any]]:
             """
             SELECT runs.*, reports.name AS report_name, reports.output_formats AS report_output_formats
             FROM runs JOIN reports ON reports.id = runs.report_id
-            ORDER BY runs.started_at DESC LIMIT ?
+            ORDER BY runs.started_at DESC, runs.id DESC LIMIT ?
             """,
             (limit,),
         ).fetchall()
@@ -1047,8 +1147,8 @@ def write_docx(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, 
 
 
 def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, summaries: list[dict[str, Any]], query_params: dict[str, Any] | None = None) -> Path:
-    output_dir = OUTPUT_DIR / f"run-{run_id}"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Run IDs can repeat when the portal switches its metadata database.
+    output_dir = Path(tempfile.mkdtemp(prefix=f"run-{run_id}-", dir=OUTPUT_DIR))
     with (output_dir / "data.json").open("w", encoding="utf-8") as fh:
         json.dump(rows, fh, ensure_ascii=False, indent=2, default=str)
     with (output_dir / "summary.json").open("w", encoding="utf-8") as fh:
@@ -1181,22 +1281,25 @@ def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: in
     return output_dir
 
 
-def execute_report(report_id: int, supplied_parameters: dict[str, Any] | None = None) -> dict[str, Any]:
-    report = get_report(report_id)
+def execute_report(report_id: int, supplied_parameters: dict[str, Any] | None = None,
+                   trigger_type: str = "manual", scheduled_for: str | None = None,
+                   snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+    report = snapshot or get_report(report_id)
     if not report:
         raise ValueError("报表不存在")
-    query_params = normalize_run_parameters(report, supplied_parameters)
     started = utc_now()
     with connection() as conn:
         cursor = conn.execute(
-            "INSERT INTO runs(report_id, status, started_at, parameters) VALUES (?, ?, ?, ?)",
-            (report_id, "running", iso(started), json.dumps(query_params, ensure_ascii=False)),
+            "INSERT INTO runs(report_id, status, started_at, trigger_type, scheduled_for, schedule_snapshot) VALUES (?, ?, ?, ?, ?, ?)",
+            (report_id, "running", iso(started), trigger_type, scheduled_for,
+             json.dumps({key: report[key] for key in SCHEDULE_FIELDS}, ensure_ascii=False)),
         )
         run_id = cursor.lastrowid
     try:
+        query_params = normalize_run_parameters(report, supplied_parameters)
         with connection() as conn:
-            # Report definitions are read-only by contract, including WITH
-            # statements that could otherwise wrap an UPDATE/DELETE in SQLite.
+            conn.execute("UPDATE runs SET parameters=? WHERE id=?", (json.dumps(query_params, ensure_ascii=False), run_id))
+        with connection() as conn:
             conn.execute("PRAGMA query_only = ON")
             result = conn.execute(report["sql"], query_params)
             columns = [item[0] for item in result.description or []]
@@ -1204,25 +1307,21 @@ def execute_report(report_id: int, supplied_parameters: dict[str, Any] | None = 
         summaries = evaluate_formulas(report, rows)
         output_dir = write_outputs(report, rows, run_id, summaries, query_params)
         finished = utc_now()
-        next_run = finished + timedelta(minutes=report["schedule_minutes"]) if report["schedule_minutes"] else None
         with connection() as conn:
             conn.execute(
                 "UPDATE runs SET status=?, finished_at=?, row_count=?, output_dir=? WHERE id=?",
                 ("success", iso(finished), len(rows), str(output_dir), run_id),
             )
-            conn.execute(
-                "UPDATE reports SET last_run_at=?, next_run_at=?, updated_at=? WHERE id=?",
-                (iso(finished), iso(next_run), iso(finished), report_id),
-            )
         return get_run(run_id) or {"id": run_id, "status": "success"}
-    except Exception as exc:  # noqa: BLE001 - persisted for the UI
-        finished = utc_now()
+    except Exception as exc:
         with connection() as conn:
-            conn.execute(
-                "UPDATE runs SET status=?, finished_at=?, error=? WHERE id=?",
-                ("failed", iso(finished), str(exc), run_id),
-            )
+            conn.execute("UPDATE runs SET status=?, finished_at=?, error=? WHERE id=?",
+                         ("failed", iso(utc_now()), str(exc), run_id))
         raise
+    finally:
+        # Execution never overwrites the plan, including edits made while a job runs.
+        with connection() as conn:
+            conn.execute("UPDATE reports SET last_run_at=? WHERE id=?", (iso(utc_now()), report_id))
 
 
 def get_run(run_id: int) -> dict[str, Any] | None:
@@ -1247,62 +1346,96 @@ class Scheduler:
         with self.lock:
             if self.running:
                 return
-            self.running = True
-            self.paused = False
-            self.stop_event.clear()
-            self.thread = threading.Thread(target=self._loop, name="report-scheduler", daemon=True)
+            self.running, self.paused = True, False
+            # A stopped generation keeps its own signalled event after restart.
+            self.stop_event = threading.Event()
+            self.thread = threading.Thread(target=self._loop, args=(self.stop_event,), name="report-scheduler", daemon=True)
             self.thread.start()
 
     def stop(self) -> None:
         with self.lock:
             self.running = False
+            self.paused = False
             self.stop_event.set()
 
     def pause(self) -> None:
-        self.paused = True
+        with self.lock:
+            if self.running:
+                self.paused = True
 
     def resume(self) -> None:
-        if not self.running:
-            self.start()
-        self.paused = False
+        self.start()
+        with self.lock:
+            self.paused = False
 
-    def trigger(self, report_id: int, parameters: dict[str, Any] | None = None) -> bool:
+    def trigger(self, report_id: int, parameters: dict[str, Any] | None = None,
+                scheduled_for: str | None = None, now: datetime | None = None) -> bool:
         with self.lock:
             if report_id in self.active:
                 return False
-            thread = threading.Thread(target=self._run_one, args=(report_id, parameters or {}), daemon=True)
+            now = now or utc_now()
+            with connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+                if not row:
+                    raise ValueError("报表不存在")
+                report = row_to_report(row)
+                if scheduled_for is not None:
+                    if not self.running or self.paused or not report["enabled"] or report["schedule_type"] == "manual":
+                        return False
+                    due = parse_iso(report.get("next_run_at"))
+                    if not due or report["next_run_at"] != scheduled_for or due > now:
+                        return False
+                    # Reserve this occurrence before dispatch, on success AND failure.
+                    # Missed occurrences are coalesced into one execution.
+                    next_run = next_schedule_run(report, now)
+                    if report["schedule_type"] == "interval":
+                        step = timedelta(minutes=report["schedule_minutes"])
+                        next_run = due + step * (int((now - due) // step) + 1)
+                    conn.execute("UPDATE reports SET next_run_at=? WHERE id=?", (iso(next_run), report_id))
+                else:
+                    parameters = normalize_run_parameters(report, parameters)
+            thread = threading.Thread(target=self._run_one,
+                                      args=(report_id, parameters, scheduled_for, report), daemon=True)
             self.active[report_id] = thread
             thread.start()
             return True
 
-    def _run_one(self, report_id: int, parameters: dict[str, Any]) -> None:
+    def _run_one(self, report_id: int, parameters: dict[str, Any] | None,
+                 scheduled_for: str | None, snapshot: dict[str, Any]) -> None:
         try:
-            execute_report(report_id, parameters)
-        except Exception:
-            pass
+            execute_report(report_id, parameters, "scheduled" if scheduled_for else "manual", scheduled_for, snapshot)
+        except Exception as exc:
+            print(f"Report {report_id} failed: {exc}")
         finally:
             with self.lock:
                 self.active.pop(report_id, None)
 
-    def _loop(self) -> None:
-        while not self.stop_event.wait(1):
+    def dispatch_due(self, now: datetime | None = None) -> None:
+        now = now or utc_now()
+        for report in report_rows():
+            if not report["enabled"] or report["schedule_type"] == "manual":
+                continue
+            due = parse_iso(report.get("next_run_at"))
+            if due and due <= now:
+                self.trigger(report["id"], scheduled_for=report["next_run_at"], now=now)
+
+    def _loop(self, stop_event: threading.Event) -> None:
+        while not stop_event.wait(1):
             if not self.running or self.paused:
                 continue
-            now = utc_now()
-            for report in report_rows():
-                if not report["enabled"] or not report["schedule_minutes"]:
-                    continue
-                next_run = parse_iso(report.get("next_run_at"))
-                if next_run and next_run <= now:
-                    self.trigger(report["id"])
+            try:
+                self.dispatch_due()
+            except Exception as exc:
+                print(f"Scheduler error: {exc}")
 
     def status(self) -> dict[str, Any]:
-        return {
-            "running": self.running,
-            "paused": self.paused,
-            "active_runs": list(self.active),
-            "database": str(DB_PATH),
-        }
+        with self.lock:
+            return {
+                "running": self.running, "paused": self.paused,
+                "active_runs": list(self.active), "database": str(DB_PATH),
+                "default_timezone": DEFAULT_TIMEZONE, "server_time": iso(utc_now()),
+            }
 
 
 SCHEDULER = Scheduler()
@@ -1384,11 +1517,12 @@ class PortalHandler(BaseHTTPRequestHandler):
                 if not run:
                     self.send_json({"error": "运行记录不存在"}, HTTPStatus.NOT_FOUND)
                     return
+                output_dir = Path(run["output_dir"]) if run.get("output_dir") else OUTPUT_DIR / f"run-{run_id}"
                 if len(parts) >= 5 and parts[4] == "data":
-                    data_path = OUTPUT_DIR / f"run-{run_id}" / "data.json"
+                    data_path = output_dir / "data.json"
                     self.send_file(data_path, "application/json; charset=utf-8")
                 elif len(parts) >= 5 and parts[4] == "summary":
-                    summary_path = OUTPUT_DIR / f"run-{run_id}" / "summary.json"
+                    summary_path = output_dir / "summary.json"
                     self.send_file(summary_path, "application/json; charset=utf-8")
                 elif len(parts) >= 5 and parts[4] == "file":
                     fmt = query.get("format", ["html"])[0]
@@ -1396,7 +1530,7 @@ class PortalHandler(BaseHTTPRequestHandler):
                     if fmt not in mapping:
                         raise ValueError("不支持的文件格式")
                     filename, content_type = mapping[fmt]
-                    self.send_file(OUTPUT_DIR / f"run-{run_id}" / filename, content_type, None if fmt == "html" else filename)
+                    self.send_file(output_dir / filename, content_type, None if fmt == "html" else filename)
                 else:
                     self.send_json(run)
             elif path == "/api/database/tables":
@@ -1431,16 +1565,16 @@ class PortalHandler(BaseHTTPRequestHandler):
             elif path == "/api/reports":
                 data = validate_report_payload(payload)
                 now = utc_now()
-                next_run = now + timedelta(minutes=data["schedule_minutes"]) if data["schedule_minutes"] else None
+                next_run = next_schedule_run(data, now)
                 with connection() as conn:
                     cursor = conn.execute(
                         """
                         INSERT INTO reports
                         (name, description, sql, chart_type, x_column, y_column, formulas, parameters, layout, output_formats,
-                         schedule_minutes, enabled, created_at, updated_at, next_run_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         schedule_minutes, schedule_type, schedule_time, schedule_timezone, enabled, created_at, updated_at, next_run_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (data["name"], data["description"], data["sql"], data["chart_type"], data["x_column"], data["y_column"], json.dumps(data["formulas"], ensure_ascii=False), json.dumps(data["parameters"], ensure_ascii=False), json.dumps(data["layout"], ensure_ascii=False), json.dumps(data["output_formats"], ensure_ascii=False), data["schedule_minutes"], int(data["enabled"]), iso(now), iso(now), iso(next_run)),
+                        (data["name"], data["description"], data["sql"], data["chart_type"], data["x_column"], data["y_column"], json.dumps(data["formulas"], ensure_ascii=False), json.dumps(data["parameters"], ensure_ascii=False), json.dumps(data["layout"], ensure_ascii=False), json.dumps(data["output_formats"], ensure_ascii=False), data["schedule_minutes"], data["schedule_type"], data["schedule_time"], data["schedule_timezone"], int(data["enabled"]), iso(now), iso(now), iso(next_run)),
                     )
                     report_id = cursor.lastrowid
                 self.send_json(get_report(report_id), HTTPStatus.CREATED)
@@ -1472,22 +1606,28 @@ class PortalHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "接口不存在"}, HTTPStatus.NOT_FOUND)
                 return
             report_id = parse_id(path.split("/")[3])
-            existing = get_report(report_id)
-            if not existing:
-                self.send_json({"error": "报表不存在"}, HTTPStatus.NOT_FOUND)
-                return
             payload = self.read_json()
-            merged = {**existing, **payload}
-            data = validate_report_payload(merged, report_id)
-            now = utc_now()
-            next_run = now + timedelta(minutes=data["schedule_minutes"]) if data["schedule_minutes"] else None
             with connection() as conn:
+                # Serialize reading and saving the plan with scheduler reservations.
+                # Otherwise an unrelated edit can restore an already-dispatched time.
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+                if not row:
+                    self.send_json({"error": "报表不存在"}, HTTPStatus.NOT_FOUND)
+                    return
+                existing = row_to_report(row)
+                merged = {**existing, **payload}
+                if "schedule_minutes" in payload and "schedule_type" not in payload:
+                    merged["schedule_type"] = "interval" if payload["schedule_minutes"] else "manual"
+                data = validate_report_payload(merged, report_id)
+                now = utc_now()
+                next_run = (parse_iso(existing.get("next_run_at")) if all(data[k] == existing[k] for k in SCHEDULE_FIELDS) else next_schedule_run(data, now))
                 conn.execute(
                     """
                     UPDATE reports SET name=?, description=?, sql=?, chart_type=?, x_column=?, y_column=?,
-                    formulas=?, parameters=?, layout=?, output_formats=?, schedule_minutes=?, enabled=?, updated_at=?, next_run_at=? WHERE id=?
+                    formulas=?, parameters=?, layout=?, output_formats=?, schedule_minutes=?, schedule_type=?, schedule_time=?, schedule_timezone=?, enabled=?, updated_at=?, next_run_at=? WHERE id=?
                     """,
-                    (data["name"], data["description"], data["sql"], data["chart_type"], data["x_column"], data["y_column"], json.dumps(data["formulas"], ensure_ascii=False), json.dumps(data["parameters"], ensure_ascii=False), json.dumps(data["layout"], ensure_ascii=False), json.dumps(data["output_formats"], ensure_ascii=False), data["schedule_minutes"], int(data["enabled"]), iso(now), iso(next_run), report_id),
+                    (data["name"], data["description"], data["sql"], data["chart_type"], data["x_column"], data["y_column"], json.dumps(data["formulas"], ensure_ascii=False), json.dumps(data["parameters"], ensure_ascii=False), json.dumps(data["layout"], ensure_ascii=False), json.dumps(data["output_formats"], ensure_ascii=False), data["schedule_minutes"], data["schedule_type"], data["schedule_time"], data["schedule_timezone"], int(data["enabled"]), iso(now), iso(next_run), report_id),
                 )
             self.send_json(get_report(report_id))
         except (ValueError, json.JSONDecodeError, sqlite3.IntegrityError) as exc:
