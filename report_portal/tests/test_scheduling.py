@@ -235,6 +235,7 @@ class PortalScheduling(unittest.TestCase):
     def test_legacy_schema_migration_is_idempotent(self):
         report=self.create(schedule_type='interval',schedule_minutes=5)
         with app.connection() as conn:
+            conn.execute('DROP INDEX IF EXISTS reports_due_idx')
             for field in ('schedule_type','schedule_time','schedule_timezone'):
                 conn.execute(f'ALTER TABLE reports DROP COLUMN {field}')
         app.init_db()

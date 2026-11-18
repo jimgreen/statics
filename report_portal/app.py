@@ -18,6 +18,7 @@ import sqlite3
 import threading
 import time
 import tempfile
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+if __package__:
+    from .result_store import page_options, result_page, write_result_store
+else:
+    from result_store import page_options, result_page, write_result_store
 
 
 ROOT = Path(__file__).resolve().parent
@@ -189,9 +195,13 @@ def init_db() -> None:
             "trigger_type": "TEXT NOT NULL DEFAULT 'legacy'",
             "scheduled_for": "TEXT",
             "schedule_snapshot": "TEXT NOT NULL DEFAULT '{}'",
+            "metrics": "TEXT NOT NULL DEFAULT '{}'",
         }.items():
             if field not in run_columns:
                 conn.execute(f"ALTER TABLE runs ADD COLUMN {field} {declaration}")
+        conn.execute('CREATE INDEX IF NOT EXISTS runs_started_idx ON runs(started_at DESC, id DESC)')
+        conn.execute('CREATE INDEX IF NOT EXISTS runs_report_idx ON runs(report_id, started_at DESC, id DESC)')
+        conn.execute('CREATE INDEX IF NOT EXISTS reports_due_idx ON reports(enabled, schedule_type, next_run_at)')
         seed_demo_database(conn)
         demo_formulas = json.dumps([
             {"name": "最大值", "formula": "=MAX(amount)"},
@@ -301,6 +311,7 @@ def row_to_run(row: sqlite3.Row) -> dict[str, Any]:
     except json.JSONDecodeError:
         result["parameters"] = {}
     result["schedule_snapshot"] = json.loads(result.get("schedule_snapshot") or "{}")
+    result["metrics"] = json.loads(result.get("metrics") or "{}")
     return result
 
 
@@ -653,11 +664,15 @@ def validate_report_payload(payload: dict[str, Any], existing_id: int | None = N
     }
 
 
-def report_rows() -> list[dict[str, Any]]:
+def report_rows(summary: bool = False) -> list[dict[str, Any]]:
     with connection() as conn:
+        fields = ('id, name, description, schedule_type, schedule_time, schedule_timezone, '
+                  'schedule_minutes, enabled, next_run_at, last_run_at, updated_at, output_formats') if summary else '*'
         rows = conn.execute(
-            "SELECT * FROM reports ORDER BY updated_at DESC, id DESC"
+            f"SELECT {fields} FROM reports ORDER BY updated_at DESC, id DESC"
         ).fetchall()
+    if summary:
+        return [{**dict(row), 'output_formats': json.loads(row['output_formats'])} for row in rows]
     return [row_to_report(row) for row in rows]
 
 
@@ -672,6 +687,40 @@ def run_rows(limit: int = 100) -> list[dict[str, Any]]:
             (limit,),
         ).fetchall()
     return [row_to_run(row) for row in rows]
+
+
+def run_page(query: dict[str, list[str]]) -> dict[str, Any]:
+    page, size = page_options(query)
+    conditions, params = [], []
+    for field, allowed in [('status', {'running', 'success', 'failed'}),
+                           ('trigger_type', {'manual', 'scheduled', 'legacy'})]:
+        value = query.get(field, [''])[0]
+        if value:
+            if value not in allowed:
+                raise ValueError('无效的历史筛选条件')
+            conditions.append(f'runs.{field}=?')
+            params.append(value)
+    if query.get('report_id', [''])[0]:
+        conditions.append('runs.report_id=?')
+        params.append(parse_id(query['report_id'][0]))
+    search = query.get('q', [''])[0].strip()
+    if search:
+        conditions.append("(instr(lower(reports.name), lower(?))>0 OR instr(lower(runs.parameters), lower(?))>0)")
+        params.extend([search, search])
+    where = 'WHERE ' + ' AND '.join(conditions) if conditions else ''
+    joined = f'FROM runs JOIN reports ON reports.id=runs.report_id {where}'
+    with connection() as conn:
+        conn.execute('BEGIN')
+        totals = dict(conn.execute(f'''SELECT COUNT(*) AS total,
+            COALESCE(SUM(runs.status='success'), 0) AS success,
+            COALESCE(SUM(runs.status='failed'), 0) AS failed,
+            COALESCE(SUM(runs.status='running'), 0) AS running {joined}''', params).fetchone())
+        page = min(page, max(1, (totals['total'] + size - 1) // size))
+        rows = conn.execute(f'''SELECT runs.*, reports.name AS report_name,
+            reports.output_formats AS report_output_formats {joined}
+            ORDER BY runs.started_at DESC, runs.id DESC LIMIT ? OFFSET ?''',
+            [*params, size, (page - 1) * size]).fetchall()
+    return dict(items=[row_to_run(row) for row in rows], page=page, page_size=size, **totals)
 
 
 def preview_query(sql: str, limit: int = 50, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -870,7 +919,62 @@ def aggregate_cell_values(values: list[Any], aggregate: str) -> Any:
     return values[0]
 
 
+_source_context: ContextVar[Any] = ContextVar('report_source_context', default=None)
+
+
+class SourceContext:
+    """Reuse values within one export only; concurrent runs have separate contexts."""
+
+    def __init__(self, rows: list[dict[str, Any]], parameters: dict[str, Any]):
+        self.rows, self.parameters = rows, parameters
+        self.values: dict[tuple, Any] = {}
+        self.fields: dict[str, list[Any]] = {}
+        self.conn = None
+        self.metrics = {'source_queries': 0, 'cache_hits': 0, 'source_requests': 0}
+
+    def resolve(self, source: dict[str, Any]) -> Any:
+        kind = source.get('type', 'static')
+        if kind == 'static':
+            return source.get('value', '')
+        key = (kind, str(source.get('sql', '')).strip()) if kind == 'sql' else (
+            (kind, source.get('formula', '')) if kind == 'formula' else
+            (kind, source.get('field', ''), source.get('aggregate', 'first')))
+        self.metrics['source_requests'] += 1
+        if key in self.values:
+            self.metrics['cache_hits'] += 1
+            return self.values[key]
+        if kind == 'sql':
+            if not key[1]:
+                value = []
+            else:
+                if self.conn is None:
+                    self.conn = connection()
+                    self.conn.execute('PRAGMA query_only = ON')
+                cursor = self.conn.execute(key[1], self.parameters)
+                columns = [item[0] for item in cursor.description or []]
+                value = [{c: json_value(v) for c, v in zip(columns, row)} for row in cursor]
+                self.metrics['source_queries'] += 1
+        elif kind == 'formula':
+            value = evaluate_formula(str(source.get('formula', '')), self.rows)
+        elif kind == 'report_field':
+            field = str(source.get('field', ''))
+            if field not in self.fields:
+                self.fields[field] = [row[field] for row in self.rows if field in row]
+            value = aggregate_cell_values(self.fields[field], source.get('aggregate', 'first'))
+        else:
+            value = ''
+        self.values[key] = value
+        return value
+
+    def close(self) -> None:
+        if self.conn is not None:
+            self.conn.close()
+
+
 def execute_data_source(source: dict[str, Any], report_rows: list[dict[str, Any]], query_params: dict[str, Any] | None = None) -> Any:
+    context = _source_context.get()
+    if context is not None and context.rows is report_rows and context.parameters == (query_params or {}):
+        return context.resolve(source)
     source_type = source.get("type", "static")
     if source_type == "static":
         return source.get("value", "")
@@ -909,16 +1013,14 @@ def render_data_table(data_rows: list[dict[str, Any]]) -> str:
 
 
 def render_layout_cell(cell: dict[str, Any], report_rows: list[dict[str, Any]], query_params: dict[str, Any] | None = None) -> str:
-    source = cell.get("data_source") or {"type": "static"}
+    source = dict(cell.get("data_source") or {"type": "static"})
     source.setdefault("value", cell.get("value", ""))
     value = execute_data_source(source, report_rows, query_params)
     element = cell.get("element", "text")
     if element == "table":
-        return render_data_table(cell_data_rows(source, report_rows, query_params))
+        return render_data_table(value if isinstance(value, list) else [])
     if element == "chart":
-        data_rows = cell_data_rows(source, report_rows, query_params)
-        if not data_rows and isinstance(value, list):
-            data_rows = value
+        data_rows = value if isinstance(value, list) else []
         columns = list(data_rows[0].keys()) if data_rows else []
         chart_type = source.get("chart_type", "line")
         x_field = source.get("x_field") or (columns[0] if columns else "")
@@ -1146,7 +1248,20 @@ def write_docx(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, 
     document.save(output_path)
 
 
-def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, summaries: list[dict[str, Any]], query_params: dict[str, Any] | None = None) -> Path:
+def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, summaries: list[dict[str, Any]], query_params: dict[str, Any] | None = None, columns: list[str] | None = None) -> Path:
+    context = SourceContext(rows, query_params or {})
+    token = _source_context.set(context)
+    try:
+        directory = _write_outputs(report, rows, run_id, summaries, query_params)
+        write_result_store(directory, rows, columns)
+        (directory / 'metrics.json').write_text(json.dumps(context.metrics), encoding='utf-8')
+        return directory
+    finally:
+        _source_context.reset(token)
+        context.close()
+
+
+def _write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, summaries: list[dict[str, Any]], query_params: dict[str, Any] | None = None) -> Path:
     # Run IDs can repeat when the portal switches its metadata database.
     output_dir = Path(tempfile.mkdtemp(prefix=f"run-{run_id}-", dir=OUTPUT_DIR))
     with (output_dir / "data.json").open("w", encoding="utf-8") as fh:
@@ -1288,6 +1403,8 @@ def execute_report(report_id: int, supplied_parameters: dict[str, Any] | None = 
     if not report:
         raise ValueError("报表不存在")
     started = utc_now()
+    started_clock = time.perf_counter()
+    metrics = {}
     with connection() as conn:
         cursor = conn.execute(
             "INSERT INTO runs(report_id, status, started_at, trigger_type, scheduled_for, schedule_snapshot) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1299,24 +1416,31 @@ def execute_report(report_id: int, supplied_parameters: dict[str, Any] | None = 
         query_params = normalize_run_parameters(report, supplied_parameters)
         with connection() as conn:
             conn.execute("UPDATE runs SET parameters=? WHERE id=?", (json.dumps(query_params, ensure_ascii=False), run_id))
+        query_clock = time.perf_counter()
         with connection() as conn:
             conn.execute("PRAGMA query_only = ON")
             result = conn.execute(report["sql"], query_params)
             columns = [item[0] for item in result.description or []]
-            rows = [{column: json_value(value) for column, value in zip(columns, row)} for row in result.fetchall()]
+            rows = [{column: json_value(value) for column, value in zip(columns, row)} for row in result]
+        metrics['query_ms'] = round((time.perf_counter() - query_clock) * 1000, 2)
+        output_clock = time.perf_counter()
         summaries = evaluate_formulas(report, rows)
-        output_dir = write_outputs(report, rows, run_id, summaries, query_params)
+        output_dir = write_outputs(report, rows, run_id, summaries, query_params, columns)
+        metrics.update(json.loads((output_dir / 'metrics.json').read_text(encoding='utf-8')))
+        metrics['output_ms'] = round((time.perf_counter() - output_clock) * 1000, 2)
+        metrics['duration_ms'] = round((time.perf_counter() - started_clock) * 1000, 2)
         finished = utc_now()
         with connection() as conn:
             conn.execute(
-                "UPDATE runs SET status=?, finished_at=?, row_count=?, output_dir=? WHERE id=?",
-                ("success", iso(finished), len(rows), str(output_dir), run_id),
+                "UPDATE runs SET status=?, finished_at=?, row_count=?, output_dir=?, metrics=? WHERE id=?",
+                ("success", iso(finished), len(rows), str(output_dir), json.dumps(metrics), run_id),
             )
         return get_run(run_id) or {"id": run_id, "status": "success"}
     except Exception as exc:
+        metrics['duration_ms'] = round((time.perf_counter() - started_clock) * 1000, 2)
         with connection() as conn:
-            conn.execute("UPDATE runs SET status=?, finished_at=?, error=? WHERE id=?",
-                         ("failed", iso(utc_now()), str(exc), run_id))
+            conn.execute("UPDATE runs SET status=?, finished_at=?, error=?, metrics=? WHERE id=?",
+                         ("failed", iso(utc_now()), str(exc), json.dumps(metrics), run_id))
         raise
     finally:
         # Execution never overwrites the plan, including edits made while a job runs.
@@ -1413,12 +1537,12 @@ class Scheduler:
 
     def dispatch_due(self, now: datetime | None = None) -> None:
         now = now or utc_now()
-        for report in report_rows():
-            if not report["enabled"] or report["schedule_type"] == "manual":
-                continue
-            due = parse_iso(report.get("next_run_at"))
-            if due and due <= now:
-                self.trigger(report["id"], scheduled_for=report["next_run_at"], now=now)
+        with connection() as conn:
+            due = conn.execute('''SELECT id, next_run_at FROM reports
+                WHERE enabled=1 AND schedule_type!='manual' AND julianday(next_run_at)<=julianday(?)''',
+                (iso(now),)).fetchall()
+        for report in due:
+            self.trigger(report['id'], scheduled_for=report['next_run_at'], now=now)
 
     def _loop(self, stop_event: threading.Event) -> None:
         while not stop_event.wait(1):
@@ -1500,7 +1624,7 @@ class PortalHandler(BaseHTTPRequestHandler):
             elif path == "/api/status":
                 self.send_json(SCHEDULER.status())
             elif path == "/api/reports":
-                self.send_json({"items": report_rows()})
+                self.send_json({"items": report_rows(summary=query.get('summary') == ['1'])})
             elif path.startswith("/api/reports/"):
                 report_id = parse_id(path.split("/")[3])
                 report = get_report(report_id)
@@ -1509,7 +1633,7 @@ class PortalHandler(BaseHTTPRequestHandler):
                 else:
                     self.send_json(report)
             elif path == "/api/runs":
-                self.send_json({"items": run_rows()})
+                self.send_json(run_page(query) if query else {"items": run_rows()})
             elif path.startswith("/api/runs/"):
                 parts = path.split("/")
                 run_id = parse_id(parts[3])
@@ -1519,8 +1643,10 @@ class PortalHandler(BaseHTTPRequestHandler):
                     return
                 output_dir = Path(run["output_dir"]) if run.get("output_dir") else OUTPUT_DIR / f"run-{run_id}"
                 if len(parts) >= 5 and parts[4] == "data":
-                    data_path = output_dir / "data.json"
-                    self.send_file(data_path, "application/json; charset=utf-8")
+                    if query:
+                        self.send_json(result_page(output_dir.resolve(), query))
+                    else:
+                        self.send_file(output_dir / "data.json", "application/json; charset=utf-8")
                 elif len(parts) >= 5 and parts[4] == "summary":
                     summary_path = output_dir / "summary.json"
                     self.send_file(summary_path, "application/json; charset=utf-8")
