@@ -127,6 +127,7 @@ def init_db() -> None:
                 x_column TEXT NOT NULL DEFAULT '',
                 y_column TEXT NOT NULL DEFAULT '',
                 formulas TEXT NOT NULL DEFAULT '[]',
+                parameters TEXT NOT NULL DEFAULT '[]',
                 layout TEXT NOT NULL DEFAULT '{}',
                 output_formats TEXT NOT NULL DEFAULT '["html", "xlsx"]',
                 schedule_minutes INTEGER NOT NULL DEFAULT 0,
@@ -144,7 +145,8 @@ def init_db() -> None:
                 finished_at TEXT,
                 row_count INTEGER NOT NULL DEFAULT 0,
                 output_dir TEXT,
-                error TEXT
+                error TEXT,
+                parameters TEXT NOT NULL DEFAULT '{}'
             );
             CREATE INDEX IF NOT EXISTS idx_runs_report_started ON runs(report_id, started_at DESC);
             """
@@ -153,8 +155,13 @@ def init_db() -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(reports)").fetchall()}
         if "formulas" not in columns:
             conn.execute("ALTER TABLE reports ADD COLUMN formulas TEXT NOT NULL DEFAULT '[]'")
+        if "parameters" not in columns:
+            conn.execute("ALTER TABLE reports ADD COLUMN parameters TEXT NOT NULL DEFAULT '[]'")
         if "layout" not in columns:
             conn.execute("ALTER TABLE reports ADD COLUMN layout TEXT NOT NULL DEFAULT '{}'")
+        run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+        if "parameters" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN parameters TEXT NOT NULL DEFAULT '{}'")
         seed_demo_database(conn)
         demo_formulas = json.dumps([
             {"name": "最大值", "formula": "=MAX(amount)"},
@@ -202,6 +209,7 @@ def init_db() -> None:
 def row_to_report(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
     result["formulas"] = json.loads(result.get("formulas") or "[]")
+    result["parameters"] = normalize_parameters(result.get("parameters") or "[]")
     result["layout"] = normalize_layout(result.get("layout") or "{}")
     result["output_formats"] = json.loads(result.get("output_formats") or "[]")
     result["enabled"] = bool(result["enabled"])
@@ -216,6 +224,11 @@ def row_to_run(row: sqlite3.Row) -> dict[str, Any]:
         result["output_formats"] = json.loads(raw_formats or "[]")
     except json.JSONDecodeError:
         result["output_formats"] = []
+    raw_parameters = result.get("parameters", "{}")
+    try:
+        result["parameters"] = json.loads(raw_parameters or "{}")
+    except json.JSONDecodeError:
+        result["parameters"] = {}
     return result
 
 
@@ -244,11 +257,11 @@ def duplicate_report(report_id: int) -> dict[str, Any]:
         cursor = conn.execute(
             """
             INSERT INTO reports
-            (name, description, sql, chart_type, x_column, y_column, formulas, layout,
+            (name, description, sql, chart_type, x_column, y_column, formulas, parameters, layout,
              output_formats, schedule_minutes, enabled, created_at, updated_at, next_run_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (name, source["description"], source["sql"], source["chart_type"], source["x_column"], source["y_column"], json.dumps(source["formulas"], ensure_ascii=False), json.dumps(source["layout"], ensure_ascii=False), json.dumps(source["output_formats"], ensure_ascii=False), 0, 0, iso(now), iso(now), None),
+            (name, source["description"], source["sql"], source["chart_type"], source["x_column"], source["y_column"], json.dumps(source["formulas"], ensure_ascii=False), json.dumps(source["parameters"], ensure_ascii=False), json.dumps(source["layout"], ensure_ascii=False), json.dumps(source["output_formats"], ensure_ascii=False), 0, 0, iso(now), iso(now), None),
         )
         new_id = cursor.lastrowid
     return get_report(new_id) or {"id": new_id, "name": name}
@@ -260,7 +273,14 @@ def normalize_formulas(value: Any) -> list[dict[str, str]]:
     if value is None:
         return []
     if isinstance(value, str):
-        items: list[Any] = [line.strip() for line in value.splitlines() if line.strip()]
+        stripped = value.strip()
+        if stripped.startswith("["):
+            try:
+                items = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError("公式定义不是有效 JSON 或文本格式") from exc
+        else:
+            items = [line.strip() for line in value.splitlines() if line.strip()]
     elif isinstance(value, list):
         items = value
     else:
@@ -284,6 +304,111 @@ def normalize_formulas(value: Any) -> list[dict[str, str]]:
     if len(normalized) > 30:
         raise ValueError("单份报表最多定义 30 个统计公式")
     return normalized
+
+
+def normalize_parameters(value: Any) -> list[dict[str, Any]]:
+    """Normalize named SQLite parameters used by a report SQL statement.
+
+    Text input uses one parameter per line:
+    ``name | label | type | default | required | option1,option2``.
+    """
+
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("["):
+            try:
+                items = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError("参数定义不是有效 JSON 或文本格式") from exc
+        else:
+            items = [line.strip() for line in value.splitlines() if line.strip()]
+    elif isinstance(value, list):
+        items = value
+    else:
+        raise ValueError("参数定义必须是文本或数组")
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    allowed_types = {"text", "date", "number", "select"}
+    for item in items:
+        if isinstance(item, dict):
+            name = str(item.get("name", "")).strip()
+            label = str(item.get("label", name)).strip() or name
+            param_type = str(item.get("type", "text")).strip().lower() or "text"
+            default = item.get("default", "")
+            required = bool(item.get("required", False))
+            options = item.get("options", [])
+        else:
+            parts = [part.strip() for part in str(item).split("|")]
+            name = parts[0] if parts else ""
+            label = parts[1] if len(parts) > 1 and parts[1] else name
+            param_type = (parts[2] if len(parts) > 2 and parts[2] else "text").lower()
+            default = parts[3] if len(parts) > 3 else ""
+            required = len(parts) > 4 and parts[4].lower() in {"1", "true", "yes", "y", "是", "必填"}
+            options = parts[5].split(",") if len(parts) > 5 and parts[5] else []
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name):
+            raise ValueError(f"参数名无效：{name}；只能使用字母、数字和下划线，且不能以数字开头")
+        if name in seen:
+            raise ValueError(f"参数重复定义：{name}")
+        if param_type not in allowed_types:
+            raise ValueError(f"参数 {name} 的类型不支持：{param_type}")
+        if len(label) > 80:
+            raise ValueError(f"参数 {name} 的显示名称不能超过 80 个字符")
+        if isinstance(options, str):
+            options = [option.strip() for option in options.split(",") if option.strip()]
+        options = [str(option)[:120] for option in (options or []) if str(option).strip()]
+        if param_type == "select" and not options:
+            raise ValueError(f"下拉参数 {name} 至少需要一个选项")
+        if param_type == "number" and default not in (None, ""):
+            try:
+                default = float(default)
+                if default.is_integer():
+                    default = int(default)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"数字参数 {name} 的默认值无效") from exc
+        else:
+            default = "" if default is None else str(default)[:200]
+        if param_type == "select" and default and str(default) not in options:
+            raise ValueError(f"参数 {name} 的默认值必须属于下拉选项")
+        seen.add(name)
+        normalized.append({"name": name, "label": label[:80], "type": param_type, "default": default, "required": required, "options": options})
+    if len(normalized) > 30:
+        raise ValueError("单份报表最多定义 30 个参数")
+    return normalized
+
+
+def normalize_run_parameters(report: dict[str, Any], supplied: Any = None) -> dict[str, Any]:
+    """Apply defaults and validate one manual or scheduled execution."""
+
+    supplied = supplied if isinstance(supplied, dict) else {}
+    result: dict[str, Any] = {}
+    for definition in report.get("parameters", []):
+        name = definition["name"]
+        value = supplied.get(name, definition.get("default", ""))
+        if value is None:
+            value = ""
+        if definition.get("type") == "number":
+            if value == "":
+                normalized_value: Any = ""
+            else:
+                try:
+                    normalized_value = float(value)
+                    if normalized_value.is_integer():
+                        normalized_value = int(normalized_value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"参数 {name} 必须是数字") from exc
+        else:
+            normalized_value = str(value)
+        if definition.get("required") and normalized_value == "":
+            raise ValueError(f"参数“{definition.get('label', name)}”不能为空")
+        if definition.get("type") == "select" and normalized_value != "" and normalized_value not in definition.get("options", []):
+            raise ValueError(f"参数“{definition.get('label', name)}”的值不在选项中")
+        result[name] = normalized_value
+    unknown = set(supplied) - {item["name"] for item in report.get("parameters", [])}
+    if unknown:
+        raise ValueError(f"存在未定义参数：{', '.join(sorted(unknown))}")
+    return result
 
 
 def normalize_layout(value: Any) -> dict[str, Any]:
@@ -382,6 +507,12 @@ def validate_report_payload(payload: dict[str, Any], existing_id: int | None = N
         raise ValueError("只允许 SELECT、WITH 或 EXPLAIN 查询")
     if ";" in sql.rstrip(";" ):
         raise ValueError("不允许执行多条 SQL")
+    parameters = normalize_parameters(payload.get("parameters", []))
+    used_parameters = set(re.findall(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)", sql))
+    defined_parameters = {item["name"] for item in parameters}
+    missing_parameters = sorted(used_parameters - defined_parameters)
+    if missing_parameters:
+        raise ValueError(f"SQL 使用了未定义参数：{', '.join(missing_parameters)}")
     chart_type = str(payload.get("chart_type", "table"))
     if chart_type not in ALLOWED_CHARTS:
         raise ValueError(f"不支持的图表类型: {chart_type}")
@@ -399,6 +530,13 @@ def validate_report_payload(payload: dict[str, Any], existing_id: int | None = N
         raise ValueError("输出格式只能是 html、xlsx、csv 或 docx")
     formulas = normalize_formulas(payload.get("formulas", []))
     layout = normalize_layout(payload.get("layout"))
+    defined_parameters = {item["name"] for item in parameters}
+    for cell_key, cell in layout.get("cells", {}).items():
+        source = cell.get("data_source") or {}
+        source_sql = str(source.get("sql", "")) if source.get("type") == "sql" else ""
+        missing = sorted(set(re.findall(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)", source_sql)) - defined_parameters)
+        if missing:
+            raise ValueError(f"单元格 {cell_key} 的 SQL 使用了未定义参数：{', '.join(missing)}")
     return {
         "name": name,
         "description": str(payload.get("description", "")).strip(),
@@ -407,6 +545,7 @@ def validate_report_payload(payload: dict[str, Any], existing_id: int | None = N
         "x_column": str(payload.get("x_column", "")).strip(),
         "y_column": str(payload.get("y_column", "")).strip(),
         "formulas": formulas,
+        "parameters": parameters,
         "layout": layout,
         "output_formats": formats,
         "schedule_minutes": schedule_minutes,
@@ -435,7 +574,7 @@ def run_rows(limit: int = 100) -> list[dict[str, Any]]:
     return [row_to_run(row) for row in rows]
 
 
-def preview_query(sql: str, limit: int = 50) -> dict[str, Any]:
+def preview_query(sql: str, limit: int = 50, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
     """Execute a bounded, read-only preview for the definition editor."""
 
     sql = str(sql or "").strip()
@@ -448,7 +587,7 @@ def preview_query(sql: str, limit: int = 50) -> dict[str, Any]:
     started = time.perf_counter()
     with connection() as conn:
         conn.execute("PRAGMA query_only = ON")
-        cursor = conn.execute(sql.rstrip(";"))
+        cursor = conn.execute(sql.rstrip(";"), parameters or {})
         raw_rows = cursor.fetchmany(limit + 1)
         columns = [description[0] for description in (cursor.description or [])]
     truncated = len(raw_rows) > limit
@@ -631,7 +770,7 @@ def aggregate_cell_values(values: list[Any], aggregate: str) -> Any:
     return values[0]
 
 
-def execute_data_source(source: dict[str, Any], report_rows: list[dict[str, Any]]) -> Any:
+def execute_data_source(source: dict[str, Any], report_rows: list[dict[str, Any]], query_params: dict[str, Any] | None = None) -> Any:
     source_type = source.get("type", "static")
     if source_type == "static":
         return source.get("value", "")
@@ -647,14 +786,14 @@ def execute_data_source(source: dict[str, Any], report_rows: list[dict[str, Any]
             return []
         with connection() as conn:
             conn.execute("PRAGMA query_only = ON")
-            result = conn.execute(sql)
+            result = conn.execute(sql, query_params or {})
             columns = [item[0] for item in result.description or []]
             return [{column: json_value(value) for column, value in zip(columns, row)} for row in result.fetchall()]
     return ""
 
 
-def cell_data_rows(source: dict[str, Any], report_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    value = execute_data_source(source, report_rows)
+def cell_data_rows(source: dict[str, Any], report_rows: list[dict[str, Any]], query_params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    value = execute_data_source(source, report_rows, query_params)
     if isinstance(value, list):
         return [item for item in value if isinstance(item, dict)]
     return []
@@ -669,15 +808,15 @@ def render_data_table(data_rows: list[dict[str, Any]]) -> str:
     return f'<table class="element-table"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>'
 
 
-def render_layout_cell(cell: dict[str, Any], report_rows: list[dict[str, Any]]) -> str:
+def render_layout_cell(cell: dict[str, Any], report_rows: list[dict[str, Any]], query_params: dict[str, Any] | None = None) -> str:
     source = cell.get("data_source") or {"type": "static"}
     source.setdefault("value", cell.get("value", ""))
-    value = execute_data_source(source, report_rows)
+    value = execute_data_source(source, report_rows, query_params)
     element = cell.get("element", "text")
     if element == "table":
-        return render_data_table(cell_data_rows(source, report_rows))
+        return render_data_table(cell_data_rows(source, report_rows, query_params))
     if element == "chart":
-        data_rows = cell_data_rows(source, report_rows)
+        data_rows = cell_data_rows(source, report_rows, query_params)
         if not data_rows and isinstance(value, list):
             data_rows = value
         columns = list(data_rows[0].keys()) if data_rows else []
@@ -693,7 +832,7 @@ def render_layout_cell(cell: dict[str, Any], report_rows: list[dict[str, Any]]) 
     return html.escape(str(value if value is not None else ""))
 
 
-def render_layout_html(layout: dict[str, Any], report_rows: list[dict[str, Any]]) -> str:
+def render_layout_html(layout: dict[str, Any], report_rows: list[dict[str, Any]], query_params: dict[str, Any] | None = None) -> str:
     if not layout.get("cells") and not layout.get("merges"):
         return ""
     cells = layout.get("cells", {})
@@ -715,7 +854,7 @@ def render_layout_html(layout: dict[str, Any], report_rows: list[dict[str, Any]]
             style = cell.get("style", {})
             merge = merge_map.get((row, col), {})
             attrs = f' rowspan="{merge.get("rowspan", 1)}" colspan="{merge.get("colspan", 1)}"' if merge else ""
-            cells_html.append(f'<td{attrs} style="{layout_style(style)}">{render_layout_cell(cell, report_rows)}</td>')
+            cells_html.append(f'<td{attrs} style="{layout_style(style)}">{render_layout_cell(cell, report_rows, query_params)}</td>')
         rows_html.append(f"<tr>{''.join(cells_html)}</tr>")
     return f'<section class="designed-layout"><h2>报表版式</h2><table><tbody>{"".join(rows_html)}</tbody></table></section>'
 
@@ -782,7 +921,7 @@ def chart_svg(rows: list[dict[str, Any]], chart_type: str, x_column: str, y_colu
     return "".join(svg)
 
 
-def render_html(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, summaries: list[dict[str, Any]]) -> str:
+def render_html(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, summaries: list[dict[str, Any]], query_params: dict[str, Any] | None = None) -> str:
     columns = list(rows[0].keys()) if rows else []
     head = "".join(f"<th>{html.escape(str(column))}</th>" for column in columns)
     body = "".join(
@@ -795,23 +934,26 @@ def render_html(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int,
     )
     summary = f'<section class="summary"><h2>统计值</h2><table><thead><tr><th>指标</th><th>公式</th><th>结果</th></tr></thead><tbody>{summary_rows}</tbody></table></section>' if summaries else ""
     chart = chart_svg(rows, report["chart_type"], report["x_column"], report["y_column"])
-    designed_layout = render_layout_html(report.get("layout", {}), rows)
+    designed_layout = render_layout_html(report.get("layout", {}), rows, query_params)
+    parameter_labels = {item["name"]: item.get("label", item["name"]) for item in report.get("parameters", [])}
+    parameter_text = "".join(f"<li>{html.escape(str(parameter_labels.get(name, name)))}：{html.escape(str(value))}</li>" for name, value in (query_params or {}).items())
+    parameter_block = f"<section><h2>运行参数</h2><ul>{parameter_text}</ul></section>" if parameter_text else ""
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>{html.escape(report['name'])}</title>
 <style>body{{font-family:system-ui, sans-serif;margin:32px;color:#182230}} table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #d8dee8;padding:8px;text-align:left}} th{{background:#eef3f8}} .chart{{max-width:760px;width:100%;margin:12px 0}} .axis{{stroke:#64748b;stroke-width:1}} .bar{{fill:#2b6cb0;opacity:.85}} .line{{fill:none;stroke:#d97706;stroke-width:3}} .point{{fill:#d97706}} .label,.legend{{font-size:12px;fill:#334155}} .muted{{color:#64748b}}</style></head>
 <body><h1>{html.escape(report['name'])}</h1><p>{html.escape(report['description'])}</p>
-<p>运行编号：{run_id}　数据行数：{len(rows)}</p>{designed_layout}{summary}{chart}<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>
+<p>运行编号：{run_id}　数据行数：{len(rows)}</p>{parameter_block}{designed_layout}{summary}{chart}<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>
 </body></html>"""
 
 
-def layout_cell_text(cell: dict[str, Any], report_rows: list[dict[str, Any]]) -> str:
+def layout_cell_text(cell: dict[str, Any], report_rows: list[dict[str, Any]], query_params: dict[str, Any] | None = None) -> str:
     """Return a plain-text representation of a designed cell for Word output."""
 
     source = dict(cell.get("data_source") or {})
     source.setdefault("value", cell.get("value", ""))
     element = cell.get("element", "text")
     if element == "table":
-        data_rows = cell_data_rows(source, report_rows)
+        data_rows = cell_data_rows(source, report_rows, query_params)
         if not data_rows:
             return str(cell.get("value", "") or "暂无数据")
         columns = list(data_rows[0].keys())
@@ -821,14 +963,14 @@ def layout_cell_text(cell: dict[str, Any], report_rows: list[dict[str, Any]]) ->
             lines.append(f"… 共 {len(data_rows)} 行")
         return "\n".join(lines)
     if element == "chart":
-        data_rows = cell_data_rows(source, report_rows)
+        data_rows = cell_data_rows(source, report_rows, query_params)
         chart_type = {"line": "折线图", "bar": "柱状图", "pie": "饼图"}.get(source.get("chart_type"), "图表")
         return f"[{chart_type}，{len(data_rows)} 行数据]"
-    value = execute_data_source(source, report_rows)
+    value = execute_data_source(source, report_rows, query_params)
     return str(value if value is not None else cell.get("value", ""))
 
 
-def write_docx(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, summaries: list[dict[str, Any]], output_path: Path) -> None:
+def write_docx(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, summaries: list[dict[str, Any]], output_path: Path, query_params: dict[str, Any] | None = None) -> None:
     """Generate a readable Word report while keeping the source data tabular."""
 
     try:
@@ -849,6 +991,10 @@ def write_docx(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, 
         document.add_paragraph(report["description"])
     meta = document.add_paragraph()
     meta.add_run(f"运行编号：{run_id}    数据行数：{len(rows)}").bold = True
+    if query_params:
+        document.add_heading("运行参数", level=1)
+        for name, value in query_params.items():
+            document.add_paragraph(f"{name}：{value}", style="List Bullet")
 
     if summaries:
         document.add_heading("统计值", level=1)
@@ -873,7 +1019,7 @@ def write_docx(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, 
             for col in range(layout.get("cols", 8)):
                 key = f"r{row}c{col}"
                 cell_def = (layout.get("cells") or {}).get(key, {})
-                layout_table.cell(row, col).text = layout_cell_text(cell_def, rows)
+                layout_table.cell(row, col).text = layout_cell_text(cell_def, rows, query_params)
         for merge in layout.get("merges", []):
             start = layout_table.cell(merge["row"], merge["col"])
             end = layout_table.cell(merge["row"] + merge["rowspan"] - 1, merge["col"] + merge["colspan"] - 1)
@@ -900,7 +1046,7 @@ def write_docx(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, 
     document.save(output_path)
 
 
-def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, summaries: list[dict[str, Any]]) -> Path:
+def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: int, summaries: list[dict[str, Any]], query_params: dict[str, Any] | None = None) -> Path:
     output_dir = OUTPUT_DIR / f"run-{run_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "data.json").open("w", encoding="utf-8") as fh:
@@ -909,7 +1055,7 @@ def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: in
         json.dump(summaries, fh, ensure_ascii=False, indent=2, default=str)
     formats = set(report["output_formats"])
     if "html" in formats:
-        (output_dir / "report.html").write_text(render_html(report, rows, run_id, summaries), encoding="utf-8")
+        (output_dir / "report.html").write_text(render_html(report, rows, run_id, summaries, query_params), encoding="utf-8")
     if "csv" in formats:
         columns = list(rows[0].keys()) if rows else []
         with (output_dir / "report.csv").open("w", newline="", encoding="utf-8-sig") as fh:
@@ -918,7 +1064,7 @@ def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: in
                 writer.writeheader()
                 writer.writerows(rows)
     if "docx" in formats:
-        write_docx(report, rows, run_id, summaries, output_dir / "report.docx")
+        write_docx(report, rows, run_id, summaries, output_dir / "report.docx", query_params)
     if "xlsx" in formats:
         try:
             from openpyxl import Workbook
@@ -976,7 +1122,7 @@ def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: in
                     source.setdefault("value", definition.get("value", ""))
                     element = definition.get("element", "text")
                     if element == "table":
-                        table_rows = cell_data_rows(source, rows)
+                        table_rows = cell_data_rows(source, rows, query_params)
                         cell.value = ""
                         if table_rows:
                             table_columns = list(table_rows[0].keys())
@@ -989,7 +1135,7 @@ def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: in
                                     layout_sheet.cell(row=row + row_offset + 1, column=col + offset + 1, value=data_row.get(column_name))
                     elif element == "chart":
                         cell.value = definition.get("value", "")
-                        chart_rows = cell_data_rows(source, rows)
+                        chart_rows = cell_data_rows(source, rows, query_params)
                         chart_columns = list(chart_rows[0].keys()) if chart_rows else []
                         if chart_rows and len(chart_columns) >= 2:
                             if chart_data_sheet is None:
@@ -1011,7 +1157,7 @@ def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: in
                             element_chart.title = str(definition.get("value", "图表"))
                             layout_sheet.add_chart(element_chart, cell.coordinate)
                     else:
-                        resolved = execute_data_source(source, rows)
+                        resolved = execute_data_source(source, rows, query_params)
                         if isinstance(resolved, list):
                             if resolved and isinstance(resolved[0], dict):
                                 resolved = resolved[0].get(source.get("field", ""), next(iter(resolved[0].values()), ""))
@@ -1035,15 +1181,16 @@ def write_outputs(report: dict[str, Any], rows: list[dict[str, Any]], run_id: in
     return output_dir
 
 
-def execute_report(report_id: int) -> dict[str, Any]:
+def execute_report(report_id: int, supplied_parameters: dict[str, Any] | None = None) -> dict[str, Any]:
     report = get_report(report_id)
     if not report:
         raise ValueError("报表不存在")
+    query_params = normalize_run_parameters(report, supplied_parameters)
     started = utc_now()
     with connection() as conn:
         cursor = conn.execute(
-            "INSERT INTO runs(report_id, status, started_at) VALUES (?, ?, ?)",
-            (report_id, "running", iso(started)),
+            "INSERT INTO runs(report_id, status, started_at, parameters) VALUES (?, ?, ?, ?)",
+            (report_id, "running", iso(started), json.dumps(query_params, ensure_ascii=False)),
         )
         run_id = cursor.lastrowid
     try:
@@ -1051,11 +1198,11 @@ def execute_report(report_id: int) -> dict[str, Any]:
             # Report definitions are read-only by contract, including WITH
             # statements that could otherwise wrap an UPDATE/DELETE in SQLite.
             conn.execute("PRAGMA query_only = ON")
-            result = conn.execute(report["sql"])
+            result = conn.execute(report["sql"], query_params)
             columns = [item[0] for item in result.description or []]
             rows = [{column: json_value(value) for column, value in zip(columns, row)} for row in result.fetchall()]
         summaries = evaluate_formulas(report, rows)
-        output_dir = write_outputs(report, rows, run_id, summaries)
+        output_dir = write_outputs(report, rows, run_id, summaries, query_params)
         finished = utc_now()
         next_run = finished + timedelta(minutes=report["schedule_minutes"]) if report["schedule_minutes"] else None
         with connection() as conn:
@@ -1119,18 +1266,18 @@ class Scheduler:
             self.start()
         self.paused = False
 
-    def trigger(self, report_id: int) -> bool:
+    def trigger(self, report_id: int, parameters: dict[str, Any] | None = None) -> bool:
         with self.lock:
             if report_id in self.active:
                 return False
-            thread = threading.Thread(target=self._run_one, args=(report_id,), daemon=True)
+            thread = threading.Thread(target=self._run_one, args=(report_id, parameters or {}), daemon=True)
             self.active[report_id] = thread
             thread.start()
             return True
 
-    def _run_one(self, report_id: int) -> None:
+    def _run_one(self, report_id: int, parameters: dict[str, Any]) -> None:
         try:
-            execute_report(report_id)
+            execute_report(report_id, parameters)
         except Exception:
             pass
         finally:
@@ -1280,7 +1427,7 @@ class PortalHandler(BaseHTTPRequestHandler):
                 SCHEDULER.resume()
                 self.send_json(SCHEDULER.status())
             elif path == "/api/query/preview":
-                self.send_json(preview_query(payload.get("sql", ""), payload.get("limit", 50)))
+                self.send_json(preview_query(payload.get("sql", ""), payload.get("limit", 50), payload.get("parameters")))
             elif path == "/api/reports":
                 data = validate_report_payload(payload)
                 now = utc_now()
@@ -1289,11 +1436,11 @@ class PortalHandler(BaseHTTPRequestHandler):
                     cursor = conn.execute(
                         """
                         INSERT INTO reports
-                        (name, description, sql, chart_type, x_column, y_column, formulas, layout, output_formats,
+                        (name, description, sql, chart_type, x_column, y_column, formulas, parameters, layout, output_formats,
                          schedule_minutes, enabled, created_at, updated_at, next_run_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (data["name"], data["description"], data["sql"], data["chart_type"], data["x_column"], data["y_column"], json.dumps(data["formulas"], ensure_ascii=False), json.dumps(data["layout"], ensure_ascii=False), json.dumps(data["output_formats"], ensure_ascii=False), data["schedule_minutes"], int(data["enabled"]), iso(now), iso(now), iso(next_run)),
+                        (data["name"], data["description"], data["sql"], data["chart_type"], data["x_column"], data["y_column"], json.dumps(data["formulas"], ensure_ascii=False), json.dumps(data["parameters"], ensure_ascii=False), json.dumps(data["layout"], ensure_ascii=False), json.dumps(data["output_formats"], ensure_ascii=False), data["schedule_minutes"], int(data["enabled"]), iso(now), iso(now), iso(next_run)),
                     )
                     report_id = cursor.lastrowid
                 self.send_json(get_report(report_id), HTTPStatus.CREATED)
@@ -1302,12 +1449,15 @@ class PortalHandler(BaseHTTPRequestHandler):
                 self.send_json(duplicate_report(report_id), HTTPStatus.CREATED)
             elif path.endswith("/run") and path.startswith("/api/reports/"):
                 report_id = parse_id(path.split("/")[3])
-                if not get_report(report_id):
+                report = get_report(report_id)
+                if not report:
                     self.send_json({"error": "报表不存在"}, HTTPStatus.NOT_FOUND)
-                elif not SCHEDULER.trigger(report_id):
-                    self.send_json({"error": "该报表已有运行任务"}, HTTPStatus.CONFLICT)
                 else:
-                    self.send_json({"accepted": True, "report_id": report_id}, HTTPStatus.ACCEPTED)
+                    run_parameters = normalize_run_parameters(report, payload.get("parameters"))
+                    if not SCHEDULER.trigger(report_id, run_parameters):
+                        self.send_json({"error": "该报表已有运行任务"}, HTTPStatus.CONFLICT)
+                    else:
+                        self.send_json({"accepted": True, "report_id": report_id, "parameters": run_parameters}, HTTPStatus.ACCEPTED)
             else:
                 self.send_json({"error": "接口不存在"}, HTTPStatus.NOT_FOUND)
         except (ValueError, json.JSONDecodeError, sqlite3.IntegrityError) as exc:
@@ -1335,9 +1485,9 @@ class PortalHandler(BaseHTTPRequestHandler):
                 conn.execute(
                     """
                     UPDATE reports SET name=?, description=?, sql=?, chart_type=?, x_column=?, y_column=?,
-                    formulas=?, layout=?, output_formats=?, schedule_minutes=?, enabled=?, updated_at=?, next_run_at=? WHERE id=?
+                    formulas=?, parameters=?, layout=?, output_formats=?, schedule_minutes=?, enabled=?, updated_at=?, next_run_at=? WHERE id=?
                     """,
-                    (data["name"], data["description"], data["sql"], data["chart_type"], data["x_column"], data["y_column"], json.dumps(data["formulas"], ensure_ascii=False), json.dumps(data["layout"], ensure_ascii=False), json.dumps(data["output_formats"], ensure_ascii=False), data["schedule_minutes"], int(data["enabled"]), iso(now), iso(next_run), report_id),
+                    (data["name"], data["description"], data["sql"], data["chart_type"], data["x_column"], data["y_column"], json.dumps(data["formulas"], ensure_ascii=False), json.dumps(data["parameters"], ensure_ascii=False), json.dumps(data["layout"], ensure_ascii=False), json.dumps(data["output_formats"], ensure_ascii=False), data["schedule_minutes"], int(data["enabled"]), iso(now), iso(next_run), report_id),
                 )
             self.send_json(get_report(report_id))
         except (ValueError, json.JSONDecodeError, sqlite3.IntegrityError) as exc:
